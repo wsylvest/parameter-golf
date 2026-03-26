@@ -110,6 +110,7 @@ class Hyperparameters:
     ngram_ent_range = float(os.environ.get("NGRAM_ENT_RANGE", 0.55))
     ngram_ent_scale = float(os.environ.get("NGRAM_ENT_SCALE", 2.0))
     ngram_ent_thresh = float(os.environ.get("NGRAM_ENT_THRESH", 4.0))
+    complement_alpha = float(os.environ.get("COMPLEMENT_ALPHA", 0.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -760,7 +761,7 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
+        x = F.leaky_relu(self.fc(x), 0.5)
         return self.proj(x.square())
 
 
@@ -1102,6 +1103,17 @@ def main() -> None:
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    # Complementary training: build bigram frequency table for loss reweighting
+    bigram_lut = None
+    if args.complement_alpha > 0:
+        first_shard = load_data_shard(Path(sorted(glob.glob(args.train_files))[0]))
+        toks = first_shard.numpy().astype(np.int32)
+        bg_counts = np.zeros((args.vocab_size, args.vocab_size), dtype=np.float32)
+        np.add.at(bg_counts, (toks[:-1], toks[1:]), 1.0)
+        bg_counts /= np.maximum(bg_counts.sum(axis=1, keepdims=True), 1.0)
+        bigram_lut = torch.from_numpy(bg_counts).to(device)
+        log0(f"complement_training: alpha={args.complement_alpha} bigram_lut built from first shard")
 
     def zero_grad_all() -> None:
         for opt in optimizers:
