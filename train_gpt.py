@@ -101,6 +101,15 @@ class Hyperparameters:
     qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.0))
     swa_frac = float(os.environ.get("SWA_FRAC", 0.0))
     swa_every = int(os.environ.get("SWA_EVERY", 100))
+    ngram_cache = bool(int(os.environ.get("NGRAM_CACHE", "0")))
+    ngram_order = int(os.environ.get("NGRAM_ORDER", 7))
+    ngram_min_order = int(os.environ.get("NGRAM_MIN_ORDER", 2))
+    ngram_buckets = int(os.environ.get("NGRAM_BUCKETS", 4194304))
+    ngram_min_count = int(os.environ.get("NGRAM_MIN_COUNT", 2))
+    ngram_ent_base = float(os.environ.get("NGRAM_ENT_BASE", 0.05))
+    ngram_ent_range = float(os.environ.get("NGRAM_ENT_RANGE", 0.55))
+    ngram_ent_scale = float(os.environ.get("NGRAM_ENT_SCALE", 2.0))
+    ngram_ent_thresh = float(os.environ.get("NGRAM_ENT_THRESH", 4.0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -309,6 +318,13 @@ def eval_val_sliding(
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    use_ngram = args.ngram_cache
+    val_np = val_tokens.numpy().astype(np.int64) if use_ngram else None
+    ng_primes = np.array([36313, 27191, 50261, 41617, 31397, 23173, 19423, 14639, 11497, 8893, 7151], dtype=np.uint64)
+    n_orders = args.ngram_order - args.ngram_min_order + 1
+    ng_mask = np.uint64(args.ngram_buckets - 1)
+    ctx_tables = [np.zeros(args.ngram_buckets, dtype=np.int32) for _ in range(n_orders)] if use_ngram else None
+    full_tables = [np.zeros(args.ngram_buckets, dtype=np.int32) for _ in range(n_orders)] if use_ngram else None
     model.eval()
     with torch.inference_mode():
         for batch_i in range(0, len(rank_starts), batch_seqs):
@@ -320,14 +336,66 @@ def eval_val_sliding(
             x, y = torch.stack(x_list), torch.stack(y_list)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 logits = base_model.forward_logits(x)
-            score_logits = logits[:, -stride:].reshape(-1, logits.size(-1)).float()
-            score_targets = y[:, -stride:].reshape(-1)
-            val_loss_sum += F.cross_entropy(score_logits, score_targets, reduction="sum").to(torch.float64)
-            val_token_count += float(score_targets.numel())
-            prev_ids, tgt_ids = x[:, -stride:].reshape(-1), score_targets
-            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
-            val_byte_count += token_bytes.to(torch.float64).sum()
+            for i in range(x.size(0)):
+                ws = batch_starts[i]
+                seg_logits = logits[i, -stride:].float()
+                seg_targets = y[i, -stride:]
+                seg_nll = F.cross_entropy(seg_logits, seg_targets, reduction="none")
+                if use_ngram:
+                    seg_nll_np = seg_nll.cpu().numpy()
+                    seg_p = np.exp(-seg_nll_np.astype(np.float64))
+                    lp = F.log_softmax(seg_logits, dim=-1)
+                    seg_ent = -(lp.exp() * lp).sum(dim=-1).cpu().numpy()
+                    alpha_arr = args.ngram_ent_base + args.ngram_ent_range / (
+                        1.0 + np.exp(-args.ngram_ent_scale * (seg_ent - args.ngram_ent_thresh)))
+                    global_j = np.arange(ws + eval_seq - stride + 1, ws + eval_seq + 1, dtype=np.int64)
+                    best_p_ng = np.full(stride, -1.0)
+                    for oi in range(n_orders - 1, -1, -1):
+                        ctx_w = args.ngram_min_order + oi - 1
+                        valid = global_j >= ctx_w
+                        if not valid.any():
+                            continue
+                        vi = np.nonzero(valid)[0]
+                        jv = global_j[vi]
+                        ch = np.zeros(len(jv), dtype=np.uint64)
+                        for k in range(ctx_w):
+                            ch ^= val_np[jv - (ctx_w - k)].astype(np.uint64) * ng_primes[k % len(ng_primes)]
+                        ck = (ch & ng_mask).astype(np.int64)
+                        tgt = val_np[jv].astype(np.uint64)
+                        fk = ((ch ^ (tgt * ng_primes[ctx_w % len(ng_primes)])) & ng_mask).astype(np.int64)
+                        cc = ctx_tables[oi][ck].astype(np.float64)
+                        fc = full_tables[oi][fk].astype(np.float64)
+                        has = (cc >= args.ngram_min_count) & (best_p_ng[vi] < 0)
+                        if has.any():
+                            fi = vi[has]
+                            best_p_ng[fi] = np.clip(np.minimum(fc[has], cc[has]) / np.maximum(cc[has], 1.0), 0.0, 1.0)
+                    matched = best_p_ng >= 0
+                    if matched.any():
+                        seg_p[matched] = (1.0 - alpha_arr[matched]) * seg_p[matched] + alpha_arr[matched] * best_p_ng[matched]
+                    seg_nll = torch.from_numpy(-np.log(np.clip(seg_p, 1e-12, 1.0))).to(dtype=torch.float64, device=device)
+                    for oi in range(n_orders):
+                        ctx_w = args.ngram_min_order + oi - 1
+                        valid = global_j >= ctx_w
+                        if not valid.any():
+                            continue
+                        vi = np.nonzero(valid)[0]
+                        jv = global_j[vi]
+                        ch = np.zeros(len(jv), dtype=np.uint64)
+                        for k in range(ctx_w):
+                            ch ^= val_np[jv - (ctx_w - k)].astype(np.uint64) * ng_primes[k % len(ng_primes)]
+                        ck = (ch & ng_mask).astype(np.int64)
+                        tgt = val_np[jv].astype(np.uint64)
+                        fk = ((ch ^ (tgt * ng_primes[ctx_w % len(ng_primes)])) & ng_mask).astype(np.int64)
+                        np.add.at(ctx_tables[oi], ck, 1)
+                        np.add.at(full_tables[oi], fk, 1)
+                else:
+                    seg_nll = seg_nll.to(torch.float64)
+                val_loss_sum += seg_nll.sum()
+                val_token_count += float(stride)
+                prev_ids, tgt_ids = x[i, -stride:], y[i, -stride:]
+                tb = base_bytes_lut[tgt_ids].to(torch.float64)
+                tb += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(torch.float64)
+                val_byte_count += tb.sum()
     if dist.is_available() and dist.is_initialized():
         for t in [val_loss_sum, val_token_count, val_byte_count]:
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
