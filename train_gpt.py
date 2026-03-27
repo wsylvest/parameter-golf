@@ -105,12 +105,8 @@ class Hyperparameters:
     ngram_order = int(os.environ.get("NGRAM_ORDER", 7))
     ngram_min_order = int(os.environ.get("NGRAM_MIN_ORDER", 2))
     ngram_buckets = int(os.environ.get("NGRAM_BUCKETS", 4194304))
-    ngram_min_count = int(os.environ.get("NGRAM_MIN_COUNT", 2))
-    ngram_ent_base = float(os.environ.get("NGRAM_ENT_BASE", 0.05))
-    ngram_ent_range = float(os.environ.get("NGRAM_ENT_RANGE", 0.55))
-    ngram_ent_scale = float(os.environ.get("NGRAM_ENT_SCALE", 2.0))
-    ngram_ent_thresh = float(os.environ.get("NGRAM_ENT_THRESH", 4.0))
-    complement_alpha = float(os.environ.get("COMPLEMENT_ALPHA", 0.0))
+    neural_temp = float(os.environ.get("NEURAL_TEMP", 0.85))
+    ngram_phrase_cache = bool(int(os.environ.get("NGRAM_PHRASE_CACHE", "0")))
     ngram_prefill = bool(int(os.environ.get("NGRAM_PREFILL", "0")))
     distill_layers = int(os.environ.get("DISTILL_LAYERS", 0))  # 0=disabled, e.g. 11=distill to 11L
     distill_frac = float(os.environ.get("DISTILL_FRAC", 0.20))  # fraction of wallclock for distillation
@@ -327,91 +323,106 @@ def eval_val_sliding(
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
     use_ngram = args.ngram_cache
     val_np = val_tokens.numpy().astype(np.int64) if use_ngram else None
-    ng_primes = np.array([36313, 27191, 50261, 41617, 31397, 23173, 19423, 14639, 11497, 8893, 7151], dtype=np.uint64)
+    ng_primes = np.array([36313, 27191, 50261, 41617, 31397, 23173, 19423, 14639, 11497, 8893,
+                          7151, 6143, 5119, 4093, 3067, 2053, 1049, 557, 283, 131, 67, 37, 17,
+                          11, 7, 5, 3, 2, 58601, 48731, 43781, 39979, 34537, 29443, 25307,
+                          21611, 18313, 15413, 12979, 10889, 9001, 7433, 6089, 4951, 3989, 3187,
+                          2503, 1951, 1499, 1187, 941, 733, 571, 443, 347, 269, 211, 163, 127,
+                          101, 79, 61, 47, 41], dtype=np.uint64)
     n_orders = args.ngram_order - args.ngram_min_order + 1
     ng_mask = np.uint64(args.ngram_buckets - 1)
-    # Per-order Dirichlet concentrations: high=trust prior, low=trust counts
-    CONC = [32.0, 24.0, 16.0, 8.0, 4.0, 2.0, 1.0, 0.5, 0.25, 0.125, 0.0625, 0.03, 0.015, 0.008, 0.004]
+    n_buckets = args.ngram_buckets
+    CONC = np.array([50.0, 50.0, 7.0, 3.0, 2.0, 2.0, 2.0,
+                     1.86, 1.86, 1.86, 1.86, 1.86, 1.86, 1.86, 1.86], dtype=np.float64)
+    PHRASE_LENS = [16, 32, 64] if args.ngram_phrase_cache else []
+    PHRASE_CONC = {16: 0.05, 32: 0.02, 64: 0.01}
+    MAX_DIST = max(args.ngram_order - 1, max(PHRASE_LENS, default=0))
     if use_ngram and frozen_tables is not None:
         ctx_tables = [t.copy() for t in frozen_tables[0]]
         full_tables = [t.copy() for t in frozen_tables[1]]
     elif use_ngram:
-        ctx_tables = [np.zeros(args.ngram_buckets, dtype=np.int32) for _ in range(n_orders)]
-        full_tables = [np.zeros(args.ngram_buckets, dtype=np.int32) for _ in range(n_orders)]
+        ctx_tables = [np.zeros(n_buckets, dtype=np.int32) for _ in range(n_orders)]
+        full_tables = [np.zeros(n_buckets, dtype=np.int32) for _ in range(n_orders)]
     else:
         ctx_tables, full_tables = None, None
+    phrase_ctx = {L: np.zeros(n_buckets, dtype=np.int32) for L in PHRASE_LENS}
+    phrase_full = {L: np.zeros(n_buckets, dtype=np.int32) for L in PHRASE_LENS}
+    neural_temp = args.neural_temp
     model.eval()
     with torch.inference_mode():
         for batch_i in range(0, len(rank_starts), batch_seqs):
             batch_starts = rank_starts[batch_i:batch_i + batch_seqs]
-            x_list, y_list = [], []
-            for s in batch_starts:
-                window = val_tokens[s:s + eval_seq + 1].to(device=device, dtype=torch.int64)
-                x_list.append(window[:-1]); y_list.append(window[1:])
-            x, y = torch.stack(x_list), torch.stack(y_list)
+            B = len(batch_starts)
+            raw = torch.stack([val_tokens[s:s + eval_seq + 1].to(device=device, dtype=torch.int64) for s in batch_starts])
+            x, y = raw[:, :-1], raw[:, 1:]
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 logits = base_model.forward_logits(x)
-            for i in range(x.size(0)):
-                ws = batch_starts[i]
-                seg_logits = logits[i, -stride:].float()
-                seg_targets = y[i, -stride:]
-                seg_nll = F.cross_entropy(seg_logits, seg_targets, reduction="none")
-                if use_ngram:
-                    seg_p_nn = np.exp(-seg_nll.cpu().numpy().astype(np.float64))
-                    global_j = np.arange(ws + eval_seq - stride + 1, ws + eval_seq + 1, dtype=np.int64)
-                    tgt_tokens = val_np[global_j]
-                    # Compute hashes for ALL orders ONCE
-                    order_ck = [None] * n_orders
-                    order_fk = [None] * n_orders
-                    order_cc = [None] * n_orders
-                    order_fc = [None] * n_orders
-                    for oi in range(n_orders):
-                        ctx_w = args.ngram_min_order + oi - 1
-                        valid = global_j >= ctx_w
-                        if not valid.any():
-                            continue
-                        vi = np.nonzero(valid)[0]
-                        jv = global_j[vi]
-                        ch = np.zeros(len(jv), dtype=np.uint64)
-                        for k in range(ctx_w):
-                            ch ^= val_np[jv - (ctx_w - k)].astype(np.uint64) * ng_primes[k % len(ng_primes)]
-                        ck = (ch & ng_mask).astype(np.int64)
-                        tgt = tgt_tokens[vi].astype(np.uint64)
-                        fk = ((ch ^ (tgt * ng_primes[ctx_w % len(ng_primes)])) & ng_mask).astype(np.int64)
-                        order_ck[oi] = (vi, ck)
-                        order_fk[oi] = (vi, fk)
-                        order_cc[oi] = ctx_tables[oi][ck].astype(np.float64)
-                        order_fc[oi] = full_tables[oi][fk].astype(np.float64)
-                    # Recursive Dirichlet posterior: neural prior updated by each order
-                    p = np.copy(seg_p_nn)  # start with neural prior
-                    for oi in range(n_orders):  # ascending order: low orders first
-                        if order_cc[oi] is None:
-                            continue
-                        vi, _ = order_ck[oi]
-                        cc = order_cc[oi]
-                        fc = np.minimum(order_fc[oi], cc)  # collision mitigation
-                        active = cc >= 1.0
-                        if not active.any():
-                            continue
-                        c = CONC[min(oi, len(CONC) - 1)]
-                        p[vi] = np.where(active, (fc + c * p[vi]) / (cc + c), p[vi])
-                    seg_nll = torch.from_numpy(-np.log(np.clip(p, 1e-12, 1.0))).to(dtype=torch.float64, device=device)
-                    # Score-first: update tables AFTER scoring
-                    for oi in range(n_orders):
-                        if order_ck[oi] is None:
-                            continue
-                        vi_c, ck = order_ck[oi]
-                        vi_f, fk = order_fk[oi]
-                        np.add.at(ctx_tables[oi], ck, 1)
-                        np.add.at(full_tables[oi], fk, 1)
-                else:
-                    seg_nll = seg_nll.to(torch.float64)
+            seg_logits = logits[:, -stride:, :].float()
+            seg_targets = y[:, -stride:]
+            if use_ngram:
+                log_p = F.log_softmax(seg_logits / neural_temp, dim=-1)
+                log_p_nn = log_p.gather(2, seg_targets.unsqueeze(2)).squeeze(2)
+                p_nn_flat = torch.exp(log_p_nn).cpu().numpy().astype(np.float64).ravel()
+                bs_arr = np.array(batch_starts, dtype=np.int64)
+                offsets = bs_arr[:, None] + np.int64(eval_seq - stride + 1) + np.arange(stride, dtype=np.int64)[None, :]
+                flat_gj = offsets.ravel()
+                flat_tgt = val_np[flat_gj]
+                tgt_u64 = flat_tgt.astype(np.uint64)
+                tok_hashes = np.zeros((MAX_DIST, B * stride), dtype=np.uint64)
+                for k in range(MAX_DIST):
+                    mask_k = flat_gj >= np.int64(k + 1)
+                    src = np.where(mask_k, flat_gj - np.int64(k + 1), np.int64(0))
+                    tok_hashes[k] = np.where(mask_k, val_np[src].astype(np.uint64) * ng_primes[k], np.uint64(0))
+                cum_hash = np.bitwise_xor.accumulate(tok_hashes, axis=0)
+                p = p_nn_flat.copy()
+                order_keys: list = []
+                for oi in range(n_orders):
+                    ctx_w = args.ngram_min_order + oi - 1
+                    valid = flat_gj >= np.int64(ctx_w)
+                    if not valid.any():
+                        order_keys.append(None); continue
+                    ch = cum_hash[ctx_w - 1]
+                    ck = (ch[valid] & ng_mask).astype(np.intp)
+                    fk = ((ch[valid] ^ (tgt_u64[valid] * ng_primes[ctx_w])) & ng_mask).astype(np.intp)
+                    cc = ctx_tables[oi][ck].astype(np.float64)
+                    fc = np.minimum(full_tables[oi][fk].astype(np.float64), cc)
+                    c = CONC[min(oi, len(CONC) - 1)]
+                    active = cc >= 1.0
+                    p[valid] = np.where(active, (fc + c * p[valid]) / (cc + c), p[valid])
+                    order_keys.append((valid, ck, fk))
+                phrase_keys: dict = {}
+                for L in PHRASE_LENS:
+                    valid_ph = flat_gj >= np.int64(L)
+                    if not valid_ph.any():
+                        continue
+                    ch_ph = cum_hash[L - 1]
+                    ck_ph = (ch_ph[valid_ph] & ng_mask).astype(np.intp)
+                    fk_ph = ((ch_ph[valid_ph] ^ (tgt_u64[valid_ph] * ng_primes[L])) & ng_mask).astype(np.intp)
+                    cc_ph = phrase_ctx[L][ck_ph].astype(np.float64)
+                    fc_ph = np.minimum(phrase_full[L][fk_ph].astype(np.float64), cc_ph)
+                    c_ph = PHRASE_CONC[L]
+                    active_ph = cc_ph >= 1.0
+                    p[valid_ph] = np.where(active_ph, (fc_ph + c_ph * p[valid_ph]) / (cc_ph + c_ph), p[valid_ph])
+                    phrase_keys[L] = (valid_ph, ck_ph, fk_ph)
+                seg_nll = torch.from_numpy(-np.log(np.clip(p, 1e-12, 1.0))).reshape(B, stride).to(dtype=torch.float64, device=device)
                 val_loss_sum += seg_nll.sum()
-                val_token_count += float(stride)
-                prev_ids, tgt_ids = x[i, -stride:], y[i, -stride:]
-                tb = base_bytes_lut[tgt_ids].to(torch.float64)
-                tb += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(torch.float64)
-                val_byte_count += tb.sum()
+                for oi, keys in enumerate(order_keys):
+                    if keys is None: continue
+                    valid, ck, fk = keys
+                    ctx_tables[oi] += np.bincount(ck, minlength=n_buckets).astype(np.int32)
+                    full_tables[oi] += np.bincount(fk, minlength=n_buckets).astype(np.int32)
+                for L, (valid_ph, ck_ph, fk_ph) in phrase_keys.items():
+                    phrase_ctx[L] += np.bincount(ck_ph, minlength=n_buckets).astype(np.int32)
+                    phrase_full[L] += np.bincount(fk_ph, minlength=n_buckets).astype(np.int32)
+            else:
+                seg_nll = F.cross_entropy((seg_logits / neural_temp).reshape(-1, seg_logits.size(-1)),
+                                          seg_targets.reshape(-1), reduction="none").to(torch.float64).reshape(B, stride)
+                val_loss_sum += seg_nll.sum()
+            val_token_count += float(B * stride)
+            prev_ids, tgt_ids = x[:, -stride:].reshape(-1), y[:, -stride:].reshape(-1)
+            tb = base_bytes_lut[tgt_ids].to(torch.float64)
+            tb += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(torch.float64)
+            val_byte_count += tb.sum()
     if dist.is_available() and dist.is_initialized():
         for t in [val_loss_sum, val_token_count, val_byte_count]:
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
@@ -1136,8 +1147,8 @@ def main() -> None:
                     continue
                 positions = np.arange(ctx_w, len(shard_np), dtype=np.int64)
                 ch = np.zeros(len(positions), dtype=np.uint64)
-                for k in range(ctx_w):
-                    ch ^= shard_np[positions - (ctx_w - k)].astype(np.uint64) * ng_primes[k % len(ng_primes)]
+                for d in range(1, ctx_w + 1):
+                    ch ^= shard_np[positions - d].astype(np.uint64) * ng_primes[(d - 1) % len(ng_primes)]
                 ck = (ch & ng_mask).astype(np.int64)
                 tgt = shard_np[positions].astype(np.uint64)
                 fk = ((ch ^ (tgt * ng_primes[ctx_w % len(ng_primes)])) & ng_mask).astype(np.int64)
