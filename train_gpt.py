@@ -330,6 +330,8 @@ def eval_val_sliding(
     ng_primes = np.array([36313, 27191, 50261, 41617, 31397, 23173, 19423, 14639, 11497, 8893, 7151], dtype=np.uint64)
     n_orders = args.ngram_order - args.ngram_min_order + 1
     ng_mask = np.uint64(args.ngram_buckets - 1)
+    DISCOUNT = 0.75
+    NN_BASE_WEIGHT = 0.3
     if use_ngram and frozen_tables is not None:
         ctx_tables = [t.copy() for t in frozen_tables[0]]
         full_tables = [t.copy() for t in frozen_tables[1]]
@@ -338,6 +340,8 @@ def eval_val_sliding(
         full_tables = [np.zeros(args.ngram_buckets, dtype=np.int32) for _ in range(n_orders)]
     else:
         ctx_tables, full_tables = None, None
+    unigram_counts = np.zeros(args.vocab_size, dtype=np.float64) if use_ngram else None
+    total_scored = 0
     model.eval()
     with torch.inference_mode():
         for batch_i in range(0, len(rank_starts), batch_seqs):
@@ -355,37 +359,14 @@ def eval_val_sliding(
                 seg_targets = y[i, -stride:]
                 seg_nll = F.cross_entropy(seg_logits, seg_targets, reduction="none")
                 if use_ngram:
-                    seg_nll_np = seg_nll.cpu().numpy()
-                    seg_p = np.exp(-seg_nll_np.astype(np.float64))
-                    lp = F.log_softmax(seg_logits, dim=-1)
-                    seg_ent = -(lp.exp() * lp).sum(dim=-1).cpu().numpy()
-                    alpha_arr = args.ngram_ent_base + args.ngram_ent_range / (
-                        1.0 + np.exp(-args.ngram_ent_scale * (seg_ent - args.ngram_ent_thresh)))
+                    seg_p_nn = np.exp(-seg_nll.cpu().numpy().astype(np.float64))
                     global_j = np.arange(ws + eval_seq - stride + 1, ws + eval_seq + 1, dtype=np.int64)
-                    best_p_ng = np.full(stride, -1.0)
-                    for oi in range(n_orders - 1, -1, -1):
-                        ctx_w = args.ngram_min_order + oi - 1
-                        valid = global_j >= ctx_w
-                        if not valid.any():
-                            continue
-                        vi = np.nonzero(valid)[0]
-                        jv = global_j[vi]
-                        ch = np.zeros(len(jv), dtype=np.uint64)
-                        for k in range(ctx_w):
-                            ch ^= val_np[jv - (ctx_w - k)].astype(np.uint64) * ng_primes[k % len(ng_primes)]
-                        ck = (ch & ng_mask).astype(np.int64)
-                        tgt = val_np[jv].astype(np.uint64)
-                        fk = ((ch ^ (tgt * ng_primes[ctx_w % len(ng_primes)])) & ng_mask).astype(np.int64)
-                        cc = ctx_tables[oi][ck].astype(np.float64)
-                        fc = full_tables[oi][fk].astype(np.float64)
-                        has = (cc >= args.ngram_min_count) & (best_p_ng[vi] < 0)
-                        if has.any():
-                            fi = vi[has]
-                            best_p_ng[fi] = np.clip(np.minimum(fc[has], cc[has]) / np.maximum(cc[has], 1.0), 0.0, 1.0)
-                    matched = best_p_ng >= 0
-                    if matched.any():
-                        seg_p[matched] = (1.0 - alpha_arr[matched]) * seg_p[matched] + alpha_arr[matched] * best_p_ng[matched]
-                    seg_nll = torch.from_numpy(-np.log(np.clip(seg_p, 1e-12, 1.0))).to(dtype=torch.float64, device=device)
+                    tgt_tokens = val_np[global_j]
+                    # Compute hashes for ALL orders ONCE
+                    order_ck = [None] * n_orders
+                    order_fk = [None] * n_orders
+                    order_cc = [None] * n_orders
+                    order_fc = [None] * n_orders
                     for oi in range(n_orders):
                         ctx_w = args.ngram_min_order + oi - 1
                         valid = global_j >= ctx_w
@@ -397,10 +378,54 @@ def eval_val_sliding(
                         for k in range(ctx_w):
                             ch ^= val_np[jv - (ctx_w - k)].astype(np.uint64) * ng_primes[k % len(ng_primes)]
                         ck = (ch & ng_mask).astype(np.int64)
-                        tgt = val_np[jv].astype(np.uint64)
+                        tgt = tgt_tokens[vi].astype(np.uint64)
                         fk = ((ch ^ (tgt * ng_primes[ctx_w % len(ng_primes)])) & ng_mask).astype(np.int64)
+                        order_ck[oi] = (vi, ck)
+                        order_fk[oi] = (vi, fk)
+                        order_cc[oi] = ctx_tables[oi][ck].astype(np.float64)
+                        order_fc[oi] = full_tables[oi][fk].astype(np.float64)
+                    # Interpolated absolute discounting: compute smoothed p per order
+                    p_uni = unigram_counts[tgt_tokens] / max(total_scored, 1) if total_scored > 0 else np.full(stride, 1.0 / args.vocab_size)
+                    p_mixed = np.copy(seg_p_nn)
+                    raw_w_nn = NN_BASE_WEIGHT
+                    raw_w = np.zeros((n_orders, stride), dtype=np.float64)
+                    p_order = np.zeros((n_orders, stride), dtype=np.float64)
+                    for oi in range(n_orders):
+                        if order_cc[oi] is None:
+                            continue
+                        vi, _ = order_ck[oi]
+                        cc = order_cc[oi]
+                        fc = order_fc[oi]
+                        active = cc >= 1.0
+                        if not active.any():
+                            continue
+                        # Smoothed probability: max(fc-D,0)/cc + backoff
+                        p_disc = np.where(active, np.maximum(fc - DISCOUNT, 0.0) / np.maximum(cc, 1.0), 0.0)
+                        # Backoff: use lower order or unigram
+                        if oi > 0 and p_order[oi - 1][vi].any():
+                            backoff = p_order[oi - 1][vi]
+                        else:
+                            backoff = p_uni[vi]
+                        n_unique = np.clip(cc * 0.3, 1.0, args.vocab_size * 0.1)  # approximate unique continuations
+                        backoff_mass = np.where(active, DISCOUNT * n_unique / np.maximum(cc, 1.0), 1.0)
+                        p_order[oi][vi] = p_disc + backoff_mass * backoff
+                        raw_w[oi][vi] = np.where(active, np.log1p(cc), 0.0)
+                    # Normalize weights and mix
+                    total_w = raw_w_nn + raw_w.sum(axis=0)
+                    p_final = (raw_w_nn / total_w) * seg_p_nn
+                    for oi in range(n_orders):
+                        p_final += (raw_w[oi] / total_w) * p_order[oi]
+                    seg_nll = torch.from_numpy(-np.log(np.clip(p_final, 1e-12, 1.0))).to(dtype=torch.float64, device=device)
+                    # Score-first: update tables AFTER scoring
+                    for oi in range(n_orders):
+                        if order_ck[oi] is None:
+                            continue
+                        vi_c, ck = order_ck[oi]
+                        vi_f, fk = order_fk[oi]
                         np.add.at(ctx_tables[oi], ck, 1)
                         np.add.at(full_tables[oi], fk, 1)
+                    np.add.at(unigram_counts, tgt_tokens, 1)
+                    total_scored += stride
                 else:
                     seg_nll = seg_nll.to(torch.float64)
                 val_loss_sum += seg_nll.sum()
@@ -1145,16 +1170,7 @@ def main() -> None:
         frozen_ngram_tables = (prefill_ctx, prefill_full)
         log0(f"ngram_prefill: complete, {len(shard_files)} shards, orders {args.ngram_min_order}-{args.ngram_order}")
 
-    # Complementary training: build bigram frequency table for loss reweighting
     bigram_lut = None
-    if args.complement_alpha > 0:
-        first_shard = load_data_shard(Path(sorted(glob.glob(args.train_files))[0]))
-        toks = first_shard.numpy().astype(np.int32)
-        bg_counts = np.zeros((args.vocab_size, args.vocab_size), dtype=np.float32)
-        np.add.at(bg_counts, (toks[:-1], toks[1:]), 1.0)
-        bg_counts /= np.maximum(bg_counts.sum(axis=1, keepdims=True), 1.0)
-        bigram_lut = torch.from_numpy(bg_counts).to(device)
-        log0(f"complement_training: alpha={args.complement_alpha} bigram_lut built from first shard")
 
     def zero_grad_all() -> None:
         for opt in optimizers:
