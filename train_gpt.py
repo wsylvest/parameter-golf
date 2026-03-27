@@ -111,6 +111,11 @@ class Hyperparameters:
     ngram_ent_scale = float(os.environ.get("NGRAM_ENT_SCALE", 2.0))
     ngram_ent_thresh = float(os.environ.get("NGRAM_ENT_THRESH", 4.0))
     complement_alpha = float(os.environ.get("COMPLEMENT_ALPHA", 0.0))
+    ngram_prefill = bool(int(os.environ.get("NGRAM_PREFILL", "0")))
+    distill_layers = int(os.environ.get("DISTILL_LAYERS", 0))  # 0=disabled, e.g. 11=distill to 11L
+    distill_frac = float(os.environ.get("DISTILL_FRAC", 0.20))  # fraction of wallclock for distillation
+    distill_temp = float(os.environ.get("DISTILL_TEMP", 2.0))
+    distill_alpha = float(os.environ.get("DISTILL_ALPHA", 0.5))  # blend: alpha*KL + (1-alpha)*CE
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -310,6 +315,7 @@ def eval_val_sliding(
     args, model: nn.Module, base_model: nn.Module, rank: int, world_size: int,
     device: torch.device, val_tokens: Tensor, base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor, is_boundary_token_lut: Tensor,
+    frozen_tables=None,
 ) -> tuple[float, float]:
     eval_seq = args.eval_seq_len if args.eval_seq_len > 0 else args.train_seq_len
     stride, batch_seqs = args.eval_stride, args.eval_batch_seqs
@@ -324,8 +330,14 @@ def eval_val_sliding(
     ng_primes = np.array([36313, 27191, 50261, 41617, 31397, 23173, 19423, 14639, 11497, 8893, 7151], dtype=np.uint64)
     n_orders = args.ngram_order - args.ngram_min_order + 1
     ng_mask = np.uint64(args.ngram_buckets - 1)
-    ctx_tables = [np.zeros(args.ngram_buckets, dtype=np.int32) for _ in range(n_orders)] if use_ngram else None
-    full_tables = [np.zeros(args.ngram_buckets, dtype=np.int32) for _ in range(n_orders)] if use_ngram else None
+    if use_ngram and frozen_tables is not None:
+        ctx_tables = [t.copy() for t in frozen_tables[0]]
+        full_tables = [t.copy() for t in frozen_tables[1]]
+    elif use_ngram:
+        ctx_tables = [np.zeros(args.ngram_buckets, dtype=np.int32) for _ in range(n_orders)]
+        full_tables = [np.zeros(args.ngram_buckets, dtype=np.int32) for _ in range(n_orders)]
+    else:
+        ctx_tables, full_tables = None, None
     model.eval()
     with torch.inference_mode():
         for batch_i in range(0, len(rank_starts), batch_seqs):
@@ -761,7 +773,7 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = F.leaky_relu(self.fc(x), 0.5)
+        x = torch.relu(self.fc(x))
         return self.proj(x.square())
 
 
@@ -1046,7 +1058,7 @@ def main() -> None:
         scalar_params.append(base_model.bigram.scale)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr, "weight_decay": args.adam_wd}],
+        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1061,7 +1073,7 @@ def main() -> None:
         group["base_lr"] = args.matrix_lr
         group["wd"] = args.muon_wd
     optimizer_scalar = torch.optim.Adam(
-        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr, "weight_decay": args.adam_wd}],
+        [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
         fused=True,
@@ -1103,6 +1115,35 @@ def main() -> None:
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    # Frozen n-gram oracle: prefill tables from ALL training data
+    frozen_ngram_tables = None
+    if args.ngram_prefill and args.ngram_cache:
+        ng_primes = np.array([36313, 27191, 50261, 41617, 31397, 23173, 19423, 14639, 11497, 8893, 7151], dtype=np.uint64)
+        n_orders = args.ngram_order - args.ngram_min_order + 1
+        ng_mask = np.uint64(args.ngram_buckets - 1)
+        prefill_ctx = [np.zeros(args.ngram_buckets, dtype=np.int32) for _ in range(n_orders)]
+        prefill_full = [np.zeros(args.ngram_buckets, dtype=np.int32) for _ in range(n_orders)]
+        shard_files = sorted(glob.glob(args.train_files))
+        for si, sf in enumerate(shard_files):
+            shard_np = load_data_shard(Path(sf)).numpy().astype(np.int64)
+            for oi in range(n_orders):
+                ctx_w = args.ngram_min_order + oi - 1
+                if len(shard_np) <= ctx_w:
+                    continue
+                positions = np.arange(ctx_w, len(shard_np), dtype=np.int64)
+                ch = np.zeros(len(positions), dtype=np.uint64)
+                for k in range(ctx_w):
+                    ch ^= shard_np[positions - (ctx_w - k)].astype(np.uint64) * ng_primes[k % len(ng_primes)]
+                ck = (ch & ng_mask).astype(np.int64)
+                tgt = shard_np[positions].astype(np.uint64)
+                fk = ((ch ^ (tgt * ng_primes[ctx_w % len(ng_primes)])) & ng_mask).astype(np.int64)
+                np.add.at(prefill_ctx[oi], ck, 1)
+                np.add.at(prefill_full[oi], fk, 1)
+            if master_process and (si + 1) % 10 == 0:
+                log0(f"ngram_prefill: {si+1}/{len(shard_files)} shards processed")
+        frozen_ngram_tables = (prefill_ctx, prefill_full)
+        log0(f"ngram_prefill: complete, {len(shard_files)} shards, orders {args.ngram_min_order}-{args.ngram_order}")
 
     # Complementary training: build bigram frequency table for loss reweighting
     bigram_lut = None
@@ -1239,6 +1280,17 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
+        # Norm diagnostics every 500 steps
+        if step % 500 == 0 and step > 0:
+            with torch.no_grad():
+                norms = []
+                for bi, blk in enumerate(base_model.blocks):
+                    w_rms = sum(p.float().pow(2).mean().item() for p in blk.parameters()) ** 0.5
+                    norms.append(f"L{bi}:{w_rms:.4f}")
+                emb_rms = base_model.tok_emb.weight.float().pow(2).mean().item() ** 0.5
+                near_zero = sum((p.abs() < 1e-6).sum().item() for p in base_model.parameters()) / n_params
+                log0(f"norms emb:{emb_rms:.4f} blocks:[{','.join(norms)}] near_zero:{near_zero:.4f}")
+
         # SWA: accumulate checkpoints during warmdown
         if args.swa_frac > 0 and scale < args.swa_frac and step % args.swa_every == 0:
             with torch.no_grad():
@@ -1277,8 +1329,69 @@ def main() -> None:
     )
 
     # -----------------------------
+    # DISTILLATION: 17L teacher → 11L student (optional)
+    # -----------------------------
+    if args.distill_layers > 0 and args.distill_layers < args.num_layers:
+        log0(f"distillation: creating {args.distill_layers}L student from {args.num_layers}L teacher")
+        teacher = base_model
+        teacher.eval()
+        student = GPT(
+            vocab_size=args.vocab_size, num_layers=args.distill_layers, model_dim=args.model_dim,
+            num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
+            tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
+            logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
+            bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
+        ).to(device).bfloat16()
+        for m in student.modules():
+            if isinstance(m, CastedLinear):
+                m.float()
+        restore_low_dim_params_to_fp32(student)
+        # Copy shared weights: embedding, smear_gate, bigram, first N blocks
+        with torch.no_grad():
+            student.tok_emb.weight.copy_(teacher.tok_emb.weight)
+            student.smear_gate.gate.copy_(teacher.smear_gate.gate)
+            if student.bigram is not None and teacher.bigram is not None:
+                for sp, tp in zip(student.bigram.parameters(), teacher.bigram.parameters()):
+                    sp.copy_(tp)
+            for i in range(min(args.distill_layers, len(teacher.blocks))):
+                for sp, tp in zip(student.blocks[i].parameters(), teacher.blocks[i].parameters()):
+                    sp.copy_(tp)
+        distill_opt = torch.optim.Adam(student.parameters(), lr=args.scalar_lr * 0.1, fused=True)
+        student_compiled = torch.compile(student, dynamic=False)
+        distill_steps = 0
+        distill_t0 = time.perf_counter()
+        distill_budget_ms = args.distill_frac * (max_wallclock_ms or 120000)
+        log0(f"distillation: budget={distill_budget_ms/1000:.0f}s, temp={args.distill_temp}, alpha={args.distill_alpha}")
+        while True:
+            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, 1)
+            with torch.inference_mode():
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    teacher_logits = teacher.forward_logits(x) / args.distill_temp
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                student_loss = student_compiled(x, y)
+                student_logits = student_compiled.forward_logits(x) / args.distill_temp
+                kl = F.kl_div(F.log_softmax(student_logits.float(), dim=-1),
+                              F.softmax(teacher_logits.float(), dim=-1), reduction="batchmean") * (args.distill_temp ** 2)
+                loss = args.distill_alpha * kl + (1 - args.distill_alpha) * student_loss
+            distill_opt.zero_grad()
+            loss.backward()
+            distill_opt.step()
+            distill_steps += 1
+            elapsed = 1000.0 * (time.perf_counter() - distill_t0)
+            if distill_steps % 50 == 0:
+                log0(f"distill step:{distill_steps} loss:{loss.item():.4f} kl:{kl.item():.4f} ce:{student_loss.item():.4f} time:{elapsed:.0f}ms")
+            if elapsed >= distill_budget_ms:
+                break
+        log0(f"distillation: complete, {distill_steps} steps in {elapsed/1000:.1f}s")
+        base_model = student  # swap: export the student, not the teacher
+
+    # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
+    # Save non-SWA checkpoint first
+    if master_process:
+        torch.save(base_model.state_dict(), "final_model_noswa.pt")
+        log0(f"saved non-SWA checkpoint: {os.path.getsize('final_model_noswa.pt')} bytes")
     if swa_count > 1:
         avg = {n: (t / swa_count).to(base_model.state_dict()[n].dtype) for n, t in swa_state.items()}
         base_model.load_state_dict(avg, strict=True)
@@ -1351,6 +1464,7 @@ def main() -> None:
         sw_val_loss, sw_val_bpb = eval_val_sliding(
             args, model, base_model, rank, world_size, device,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            frozen_tables=frozen_ngram_tables,
         )
         torch.cuda.synchronize()
         log0(
