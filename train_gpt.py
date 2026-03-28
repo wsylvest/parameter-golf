@@ -101,17 +101,7 @@ class Hyperparameters:
     qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.0))
     swa_frac = float(os.environ.get("SWA_FRAC", 0.0))
     swa_every = int(os.environ.get("SWA_EVERY", 100))
-    ngram_cache = bool(int(os.environ.get("NGRAM_CACHE", "0")))
-    ngram_order = int(os.environ.get("NGRAM_ORDER", 7))
-    ngram_min_order = int(os.environ.get("NGRAM_MIN_ORDER", 2))
-    ngram_buckets = int(os.environ.get("NGRAM_BUCKETS", 4194304))
     neural_temp = float(os.environ.get("NEURAL_TEMP", 0.85))
-    ngram_phrase_cache = bool(int(os.environ.get("NGRAM_PHRASE_CACHE", "0")))
-    ngram_prefill = bool(int(os.environ.get("NGRAM_PREFILL", "0")))
-    distill_layers = int(os.environ.get("DISTILL_LAYERS", 0))  # 0=disabled, e.g. 11=distill to 11L
-    distill_frac = float(os.environ.get("DISTILL_FRAC", 0.20))  # fraction of wallclock for distillation
-    distill_temp = float(os.environ.get("DISTILL_TEMP", 2.0))
-    distill_alpha = float(os.environ.get("DISTILL_ALPHA", 0.5))  # blend: alpha*KL + (1-alpha)*CE
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -311,7 +301,6 @@ def eval_val_sliding(
     args, model: nn.Module, base_model: nn.Module, rank: int, world_size: int,
     device: torch.device, val_tokens: Tensor, base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor, is_boundary_token_lut: Tensor,
-    frozen_tables=None,
 ) -> tuple[float, float]:
     eval_seq = args.eval_seq_len if args.eval_seq_len > 0 else args.train_seq_len
     stride, batch_seqs = args.eval_stride, args.eval_batch_seqs
@@ -321,32 +310,6 @@ def eval_val_sliding(
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
-    use_ngram = args.ngram_cache
-    val_np = val_tokens.numpy().astype(np.int64) if use_ngram else None
-    ng_primes = np.array([36313, 27191, 50261, 41617, 31397, 23173, 19423, 14639, 11497, 8893,
-                          7151, 6143, 5119, 4093, 3067, 2053, 1049, 557, 283, 131, 67, 37, 17,
-                          11, 7, 5, 3, 2, 58601, 48731, 43781, 39979, 34537, 29443, 25307,
-                          21611, 18313, 15413, 12979, 10889, 9001, 7433, 6089, 4951, 3989, 3187,
-                          2503, 1951, 1499, 1187, 941, 733, 571, 443, 347, 269, 211, 163, 127,
-                          101, 79, 61, 47, 41], dtype=np.uint64)
-    n_orders = args.ngram_order - args.ngram_min_order + 1
-    ng_mask = np.uint64(args.ngram_buckets - 1)
-    n_buckets = args.ngram_buckets
-    CONC = np.array([50.0, 50.0, 7.0, 3.0, 2.0, 2.0, 2.0,
-                     1.86, 1.86, 1.86, 1.86, 1.86, 1.86, 1.86, 1.86], dtype=np.float64)
-    PHRASE_LENS = [16, 32, 64] if args.ngram_phrase_cache else []
-    PHRASE_CONC = {16: 0.05, 32: 0.02, 64: 0.01}
-    MAX_DIST = max(args.ngram_order - 1, max(PHRASE_LENS, default=0))
-    if use_ngram and frozen_tables is not None:
-        ctx_tables = [t.copy() for t in frozen_tables[0]]
-        full_tables = [t.copy() for t in frozen_tables[1]]
-    elif use_ngram:
-        ctx_tables = [np.zeros(n_buckets, dtype=np.int32) for _ in range(n_orders)]
-        full_tables = [np.zeros(n_buckets, dtype=np.int32) for _ in range(n_orders)]
-    else:
-        ctx_tables, full_tables = None, None
-    phrase_ctx = {L: np.zeros(n_buckets, dtype=np.int32) for L in PHRASE_LENS}
-    phrase_full = {L: np.zeros(n_buckets, dtype=np.int32) for L in PHRASE_LENS}
     neural_temp = args.neural_temp
     model.eval()
     with torch.inference_mode():
@@ -359,65 +322,9 @@ def eval_val_sliding(
                 logits = base_model.forward_logits(x)
             seg_logits = logits[:, -stride:, :].float()
             seg_targets = y[:, -stride:]
-            if use_ngram:
-                log_p = F.log_softmax(seg_logits / neural_temp, dim=-1)
-                log_p_nn = log_p.gather(2, seg_targets.unsqueeze(2)).squeeze(2)
-                p_nn_flat = torch.exp(log_p_nn).cpu().numpy().astype(np.float64).ravel()
-                bs_arr = np.array(batch_starts, dtype=np.int64)
-                offsets = bs_arr[:, None] + np.int64(eval_seq - stride + 1) + np.arange(stride, dtype=np.int64)[None, :]
-                flat_gj = offsets.ravel()
-                flat_tgt = val_np[flat_gj]
-                tgt_u64 = flat_tgt.astype(np.uint64)
-                tok_hashes = np.zeros((MAX_DIST, B * stride), dtype=np.uint64)
-                for k in range(MAX_DIST):
-                    mask_k = flat_gj >= np.int64(k + 1)
-                    src = np.where(mask_k, flat_gj - np.int64(k + 1), np.int64(0))
-                    tok_hashes[k] = np.where(mask_k, val_np[src].astype(np.uint64) * ng_primes[k], np.uint64(0))
-                cum_hash = np.bitwise_xor.accumulate(tok_hashes, axis=0)
-                p = p_nn_flat.copy()
-                order_keys: list = []
-                for oi in range(n_orders):
-                    ctx_w = args.ngram_min_order + oi - 1
-                    valid = flat_gj >= np.int64(ctx_w)
-                    if not valid.any():
-                        order_keys.append(None); continue
-                    ch = cum_hash[ctx_w - 1]
-                    ck = (ch[valid] & ng_mask).astype(np.intp)
-                    fk = ((ch[valid] ^ (tgt_u64[valid] * ng_primes[ctx_w])) & ng_mask).astype(np.intp)
-                    cc = ctx_tables[oi][ck].astype(np.float64)
-                    fc = np.minimum(full_tables[oi][fk].astype(np.float64), cc)
-                    c = CONC[min(oi, len(CONC) - 1)]
-                    active = cc >= 1.0
-                    p[valid] = np.where(active, (fc + c * p[valid]) / (cc + c), p[valid])
-                    order_keys.append((valid, ck, fk))
-                phrase_keys: dict = {}
-                for L in PHRASE_LENS:
-                    valid_ph = flat_gj >= np.int64(L)
-                    if not valid_ph.any():
-                        continue
-                    ch_ph = cum_hash[L - 1]
-                    ck_ph = (ch_ph[valid_ph] & ng_mask).astype(np.intp)
-                    fk_ph = ((ch_ph[valid_ph] ^ (tgt_u64[valid_ph] * ng_primes[L])) & ng_mask).astype(np.intp)
-                    cc_ph = phrase_ctx[L][ck_ph].astype(np.float64)
-                    fc_ph = np.minimum(phrase_full[L][fk_ph].astype(np.float64), cc_ph)
-                    c_ph = PHRASE_CONC[L]
-                    active_ph = cc_ph >= 1.0
-                    p[valid_ph] = np.where(active_ph, (fc_ph + c_ph * p[valid_ph]) / (cc_ph + c_ph), p[valid_ph])
-                    phrase_keys[L] = (valid_ph, ck_ph, fk_ph)
-                seg_nll = torch.from_numpy(-np.log(np.clip(p, 1e-12, 1.0))).reshape(B, stride).to(dtype=torch.float64, device=device)
-                val_loss_sum += seg_nll.sum()
-                for oi, keys in enumerate(order_keys):
-                    if keys is None: continue
-                    valid, ck, fk = keys
-                    ctx_tables[oi] += np.bincount(ck, minlength=n_buckets).astype(np.int32)
-                    full_tables[oi] += np.bincount(fk, minlength=n_buckets).astype(np.int32)
-                for L, (valid_ph, ck_ph, fk_ph) in phrase_keys.items():
-                    phrase_ctx[L] += np.bincount(ck_ph, minlength=n_buckets).astype(np.int32)
-                    phrase_full[L] += np.bincount(fk_ph, minlength=n_buckets).astype(np.int32)
-            else:
-                seg_nll = F.cross_entropy((seg_logits / neural_temp).reshape(-1, seg_logits.size(-1)),
-                                          seg_targets.reshape(-1), reduction="none").to(torch.float64).reshape(B, stride)
-                val_loss_sum += seg_nll.sum()
+            seg_nll = F.cross_entropy((seg_logits / neural_temp).reshape(-1, seg_logits.size(-1)),
+                                      seg_targets.reshape(-1), reduction="none").to(torch.float64).reshape(B, stride)
+            val_loss_sum += seg_nll.sum()
             val_token_count += float(B * stride)
             prev_ids, tgt_ids = x[:, -stride:].reshape(-1), y[:, -stride:].reshape(-1)
             tb = base_bytes_lut[tgt_ids].to(torch.float64)
@@ -1130,35 +1037,6 @@ def main() -> None:
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
-    # Frozen n-gram oracle: prefill tables from ALL training data
-    frozen_ngram_tables = None
-    if args.ngram_prefill and args.ngram_cache:
-        ng_primes = np.array([36313, 27191, 50261, 41617, 31397, 23173, 19423, 14639, 11497, 8893, 7151], dtype=np.uint64)
-        n_orders = args.ngram_order - args.ngram_min_order + 1
-        ng_mask = np.uint64(args.ngram_buckets - 1)
-        prefill_ctx = [np.zeros(args.ngram_buckets, dtype=np.int32) for _ in range(n_orders)]
-        prefill_full = [np.zeros(args.ngram_buckets, dtype=np.int32) for _ in range(n_orders)]
-        shard_files = sorted(glob.glob(args.train_files))
-        for si, sf in enumerate(shard_files):
-            shard_np = load_data_shard(Path(sf)).numpy().astype(np.int64)
-            for oi in range(n_orders):
-                ctx_w = args.ngram_min_order + oi - 1
-                if len(shard_np) <= ctx_w:
-                    continue
-                positions = np.arange(ctx_w, len(shard_np), dtype=np.int64)
-                ch = np.zeros(len(positions), dtype=np.uint64)
-                for d in range(1, ctx_w + 1):
-                    ch ^= shard_np[positions - d].astype(np.uint64) * ng_primes[(d - 1) % len(ng_primes)]
-                ck = (ch & ng_mask).astype(np.int64)
-                tgt = shard_np[positions].astype(np.uint64)
-                fk = ((ch ^ (tgt * ng_primes[ctx_w % len(ng_primes)])) & ng_mask).astype(np.int64)
-                np.add.at(prefill_ctx[oi], ck, 1)
-                np.add.at(prefill_full[oi], fk, 1)
-            if master_process and (si + 1) % 10 == 0:
-                log0(f"ngram_prefill: {si+1}/{len(shard_files)} shards processed")
-        frozen_ngram_tables = (prefill_ctx, prefill_full)
-        log0(f"ngram_prefill: complete, {len(shard_files)} shards, orders {args.ngram_min_order}-{args.ngram_order}")
-
     bigram_lut = None
 
     def zero_grad_all() -> None:
@@ -1334,63 +1212,6 @@ def main() -> None:
     )
 
     # -----------------------------
-    # DISTILLATION: 17L teacher → 11L student (optional)
-    # -----------------------------
-    if args.distill_layers > 0 and args.distill_layers < args.num_layers:
-        log0(f"distillation: creating {args.distill_layers}L student from {args.num_layers}L teacher")
-        teacher = base_model
-        teacher.eval()
-        student = GPT(
-            vocab_size=args.vocab_size, num_layers=args.distill_layers, model_dim=args.model_dim,
-            num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
-            tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
-            logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
-            bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
-        ).to(device).bfloat16()
-        for m in student.modules():
-            if isinstance(m, CastedLinear):
-                m.float()
-        restore_low_dim_params_to_fp32(student)
-        # Copy shared weights: embedding, smear_gate, bigram, first N blocks
-        with torch.no_grad():
-            student.tok_emb.weight.copy_(teacher.tok_emb.weight)
-            student.smear_gate.gate.copy_(teacher.smear_gate.gate)
-            if student.bigram is not None and teacher.bigram is not None:
-                for sp, tp in zip(student.bigram.parameters(), teacher.bigram.parameters()):
-                    sp.copy_(tp)
-            for i in range(min(args.distill_layers, len(teacher.blocks))):
-                for sp, tp in zip(student.blocks[i].parameters(), teacher.blocks[i].parameters()):
-                    sp.copy_(tp)
-        distill_opt = torch.optim.Adam(student.parameters(), lr=args.scalar_lr * 0.1, fused=True)
-        student_compiled = torch.compile(student, dynamic=False)
-        distill_steps = 0
-        distill_t0 = time.perf_counter()
-        distill_budget_ms = args.distill_frac * (max_wallclock_ms or 120000)
-        log0(f"distillation: budget={distill_budget_ms/1000:.0f}s, temp={args.distill_temp}, alpha={args.distill_alpha}")
-        while True:
-            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, 1)
-            with torch.inference_mode():
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    teacher_logits = teacher.forward_logits(x) / args.distill_temp
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                student_loss = student_compiled(x, y)
-                student_logits = student_compiled.forward_logits(x) / args.distill_temp
-                kl = F.kl_div(F.log_softmax(student_logits.float(), dim=-1),
-                              F.softmax(teacher_logits.float(), dim=-1), reduction="batchmean") * (args.distill_temp ** 2)
-                loss = args.distill_alpha * kl + (1 - args.distill_alpha) * student_loss
-            distill_opt.zero_grad()
-            loss.backward()
-            distill_opt.step()
-            distill_steps += 1
-            elapsed = 1000.0 * (time.perf_counter() - distill_t0)
-            if distill_steps % 50 == 0:
-                log0(f"distill step:{distill_steps} loss:{loss.item():.4f} kl:{kl.item():.4f} ce:{student_loss.item():.4f} time:{elapsed:.0f}ms")
-            if elapsed >= distill_budget_ms:
-                break
-        log0(f"distillation: complete, {distill_steps} steps in {elapsed/1000:.1f}s")
-        base_model = student  # swap: export the student, not the teacher
-
-    # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
     # Save non-SWA checkpoint first
@@ -1469,7 +1290,6 @@ def main() -> None:
         sw_val_loss, sw_val_bpb = eval_val_sliding(
             args, model, base_model, rank, world_size, device,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
-            frozen_tables=frozen_ngram_tables,
         )
         torch.cuda.synchronize()
         log0(
