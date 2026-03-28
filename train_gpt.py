@@ -369,8 +369,7 @@ INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = tuple(
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
-INT8_CLIP_PERCENTILE = 99.99984
-INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+GPTQ_CLIP_PERCENTILES = [0.999, 0.9995, 0.9999, 0.99999, 1.0]
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -386,17 +385,29 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
 def quantize_float_tensor(t: Tensor, bits: int = 8) -> tuple[Tensor, Tensor]:
     max_val = 2 ** (bits - 1) - 1
     t32 = t.float()
+    if t32.ndim == 2 and t32.numel() > 0:
+        best_q = None
+        best_scale = None
+        best_mse = torch.full((t32.shape[0],), float("inf"))
+        for pct in GPTQ_CLIP_PERCENTILES:
+            clip_abs = torch.quantile(t32.abs(), pct, dim=1)
+            scale = (clip_abs / max_val).clamp_min(1.0 / max_val)
+            clipped = torch.clamp(t32, -clip_abs[:, None], clip_abs[:, None])
+            q = torch.clamp(torch.round(clipped / scale[:, None]), -max_val, max_val).to(torch.int8)
+            recon = q.float() * scale[:, None]
+            mse = (t32 - recon).pow(2).mean(dim=1)
+            improved = mse < best_mse
+            if improved.any():
+                if best_q is None:
+                    best_q, best_scale, best_mse = q.clone(), scale.clone(), mse.clone()
+                else:
+                    best_q[improved] = q[improved]
+                    best_scale[improved] = scale[improved]
+                    best_mse[improved] = mse[improved]
+        return best_q.contiguous(), best_scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
     if t32.ndim == 2:
-        clip_abs = (
-            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
-            if t32.numel()
-            else torch.empty((t32.shape[0],), dtype=torch.float32)
-        )
-        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
-        scale = (clip_abs / max_val).clamp_min(1.0 / max_val)
-        q = torch.clamp(torch.round(clipped / scale[:, None]), -max_val, max_val).to(torch.int8).contiguous()
-        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
-    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
+        return torch.zeros_like(t32, dtype=torch.int8), torch.empty((t32.shape[0],), dtype=INT8_PER_ROW_SCALE_DTYPE)
+    clip_abs = float(t32.abs().max().item()) if t32.numel() else 0.0
     scale = torch.tensor(clip_abs / max_val if clip_abs > 0 else 1.0, dtype=torch.float32)
     q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -max_val, max_val).to(torch.int8).contiguous()
     return q, scale
