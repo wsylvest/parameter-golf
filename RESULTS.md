@@ -3,30 +3,37 @@ ABOUTME: It is used by Claude Code to track metrics, deltas, and keep/revert dec
 
 # Phase Results
 
-## Phase 0: Clean Neural Baseline
-- Status: COMPLETE
-- Baseline: 1487 lines (HEAD 403ec72)
-- New: 1307 lines (-180 lines, 193 lines of budget available)
-- Delta: -183 deletions, +3 insertions
-- Removed: n-gram cache (scoring, tables, primes, constants), phrase cache, frozen prefill, distillation
-- Kept: neural_temp (used in sliding eval), eval_val_sliding (pure neural CE), all architecture code
-- Neural eval: unchanged (cache was default-off, NGRAM_CACHE=0)
-- Artifact size: unchanged (cache was eval-only, never serialized)
-- Decision: **KEEP**
+## Summary
 
-## Phase 2: LeakyReLU(0.5)²
-- Status: COMPLETE
-- Change: `torch.relu(x)` → `F.leaky_relu(x, negative_slope=0.5)` in MLP.forward
-- Lines: 1320 (-1 from removed comment)
-- Rationale: #1 submission uses this, worth -0.003 bpb. Preserves negative gradient flow, eliminates dead neurons.
-- Decision: **KEEP**
+| Phase | Lines | Delta | Technique | Decision |
+|-------|-------|-------|-----------|----------|
+| 0 | 1307 | -180 | Remove dead cache/distill code | KEEP |
+| 1 | 1321 | +14 | EMA shadow weights | KEEP |
+| 2 | 1320 | -1 | LeakyReLU(0.5)² | KEEP |
+| 3 | 1325 | +5 | LN Scale by depth | KEEP |
+| 4 | 1332 | +7 | Partial RoPE | KEEP |
+| 5 | 1342 | +10 | XSA last N layers | KEEP |
+| 6 | 1353 | +11 | GPTQ-lite export | KEEP |
+| 7 | -- | -- | Warmdown/QAT | SKIP (already implemented) |
+| 8 | 1412 | +59 | Score-First TTT | KEEP |
+| 9 | -- | -- | TTT subset | SKIP (tuning, not code) |
 
-## Phase 1: Add EMA
-- Status: COMPLETE
-- Baseline: 1307 lines (Phase 0)
-- New: 1321 lines (+14)
-- Added: EMA_DECAY env var (default 0.0 = disabled), shadow weight tracking, export preference EMA > SWA > raw
-- EMA update: `ema[n].lerp_(param.cpu(), 1 - decay)` every step after optimizer
-- EMA init: copies model state_dict to CPU at training start
-- Export: EMA weights loaded into model before quantization/serialization
-- Decision: **KEEP**
+## Estimated Combined Impact
+
+| Technique | Est. bpb gain |
+|-----------|---------------|
+| LeakyReLU(0.5)² | -0.003 |
+| LN Scale | -0.002 |
+| Partial RoPE (16/64) | -0.003 |
+| XSA (last 3-4 layers) | -0.005 |
+| EMA (0.997) | -0.005 |
+| GPTQ-lite | -0.003 q_gap |
+| Score-First TTT | -0.003 |
+| **Total estimated** | **-0.024** |
+
+Starting from Run 5 baseline (1.1517), estimated target: **~1.128** (competitive with #2-3).
+
+## Line Budget
+- Start: 1487 (HEAD 403ec72)
+- Phase 0: 1307 (-180, freed budget)
+- Final: 1412 (88 remaining of 1500)
