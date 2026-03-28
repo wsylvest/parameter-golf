@@ -105,6 +105,7 @@ class Hyperparameters:
     neural_temp = float(os.environ.get("NEURAL_TEMP", 0.85))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "0")))
     rope_dims = int(os.environ.get("ROPE_DIMS", 0))
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -645,6 +646,7 @@ class CausalSelfAttention(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         rope_dims: int = 0,
+        use_xsa: bool = False,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -654,6 +656,7 @@ class CausalSelfAttention(nn.Module):
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
         self.head_dim = dim // num_heads
+        self.use_xsa = use_xsa
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         self.rope_dims = rope_dims if rope_dims > 0 else self.head_dim
@@ -686,6 +689,10 @@ class CausalSelfAttention(nn.Module):
             is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
+        if self.use_xsa:
+            v_expanded = v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1) if self.num_kv_heads != self.num_heads else v
+            v_norm = F.normalize(v_expanded, dim=-1)
+            y = y - (y * v_norm).sum(dim=-1, keepdim=True) * v_norm
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -740,11 +747,13 @@ class Block(nn.Module):
         qk_gain_init: float,
         ln_scale: float = 1.0,
         rope_dims: int = 0,
+        use_xsa: bool = False,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_dims=rope_dims)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
+                                        rope_dims=rope_dims, use_xsa=use_xsa)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -766,7 +775,7 @@ class GPT(nn.Module):
                  num_kv_heads: int, mlp_mult: int, tie_embeddings: bool, tied_embed_init_std: float,
                  logit_softcap: float, rope_base: float, qk_gain_init: float,
                  bigram_vocab_size: int = 0, bigram_dim: int = 128,
-                 ln_scale: bool = False, rope_dims: int = 0):
+                 ln_scale: bool = False, rope_dims: int = 0, xsa_last_n: int = 0):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -781,7 +790,8 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList([
             Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
-                  ln_scale=1.0 / (i + 1) ** 0.5 if ln_scale else 1.0, rope_dims=rope_dims)
+                  ln_scale=1.0 / (i + 1) ** 0.5 if ln_scale else 1.0, rope_dims=rope_dims,
+                  use_xsa=(i >= num_layers - xsa_last_n))
             for i in range(num_layers)
         ])
         self.smear_gate = SmearGate(model_dim)
@@ -956,7 +966,7 @@ def main() -> None:
         tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
-        ln_scale=args.ln_scale, rope_dims=args.rope_dims,
+        ln_scale=args.ln_scale, rope_dims=args.rope_dims, xsa_last_n=args.xsa_last_n,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
