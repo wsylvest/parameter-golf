@@ -1216,11 +1216,11 @@ def main() -> None:
         if args.swa_frac > 0 and scale < args.swa_frac and step % args.swa_every == 0:
             with torch.no_grad():
                 if swa_state is None:
-                    swa_state = {n: t.detach().cpu().clone() for n, t in base_model.state_dict().items()}
+                    swa_state = {n: t.detach().cpu().float().clone() for n, t in base_model.state_dict().items()}
                     swa_count = 1
                 else:
                     for n, t in base_model.state_dict().items():
-                        swa_state[n] += t.detach().cpu()
+                        swa_state[n] += t.detach().cpu().float()
                     swa_count += 1
 
         step += 1
@@ -1342,21 +1342,34 @@ def main() -> None:
         )
         log0(f"final_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
 
-    # Score-First TTT: score each chunk, then adapt on it with SGD
+    # Score-First TTT: score chunk, adapt on it, restore weights, repeat
     if args.ttt_lr > 0:
         torch.cuda.synchronize()
         t_ttt = time.perf_counter()
         chunk_seq = args.train_seq_len
         chunk_tokens = args.ttt_chunk_tokens
+        assert chunk_tokens % chunk_seq == 0, f"TTT_CHUNK_TOKENS ({chunk_tokens}) must be divisible by TRAIN_SEQ_LEN ({chunk_seq})"
         n_seqs = chunk_tokens // chunk_seq
         total_val = val_tokens.numel() - 1
         n_chunks = total_val // chunk_tokens
-        ttt_opt = torch.optim.SGD(base_model.parameters(), lr=args.ttt_lr, momentum=0.9)
+        # Save initial state for per-chunk reset
+        ttt_init_sd = copy.deepcopy(base_model.state_dict())
+        # Freeze matrix params (weight matrices) — only adapt embeds, scalars, gates, norms
+        ttt_params = []
+        for n, p in base_model.named_parameters():
+            if p.ndim >= 2 and min(p.shape) >= 64:
+                p.requires_grad_(False)
+            else:
+                ttt_params.append(p)
+        ttt_opt = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=0.9)
         ttt_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
         ttt_token_count = torch.zeros((), device=device, dtype=torch.float64)
         ttt_byte_count = torch.zeros((), device=device, dtype=torch.float64)
-        log0(f"ttt: starting {n_chunks} chunks, {n_seqs} seqs/chunk, {args.ttt_epochs} epochs, lr={args.ttt_lr}")
+        log0(f"ttt: {n_chunks} chunks, {n_seqs} seqs/chunk, {args.ttt_epochs} ep, lr={args.ttt_lr}, adapted_params={len(ttt_params)}")
         for ci in range(n_chunks):
+            # Reset model to initial state each chunk
+            base_model.load_state_dict(ttt_init_sd, strict=True)
+            ttt_opt.state.clear()
             cos_lr = args.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ci / max(n_chunks - 1, 1)))
             for pg in ttt_opt.param_groups:
                 pg["lr"] = cos_lr
@@ -1377,21 +1390,24 @@ def main() -> None:
                 tb = base_bytes_lut[tgt_flat].to(torch.float64)
                 tb += (has_leading_space_lut[tgt_flat] & ~is_boundary_token_lut[prev_flat]).to(torch.float64)
                 ttt_byte_count += tb.sum()
-            # Adapt on scored chunk (batched)
+            # Adapt on scored chunk (batched), then discard adaptation
             base_model.train()
             for _ in range(args.ttt_epochs):
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     adapt_loss = base_model(x_all, y_all)
                 ttt_opt.zero_grad()
                 adapt_loss.backward()
-                torch.nn.utils.clip_grad_norm_(base_model.parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(ttt_params, 1.0)
                 ttt_opt.step()
-            if ci % 200 == 0 or ci == n_chunks - 1:
-                elapsed_ttt = 1000.0 * (time.perf_counter() - t_ttt)
-                log0(f"ttt chunk:{ci+1}/{n_chunks} time:{elapsed_ttt:.0f}ms lr:{cos_lr:.5f}")
-        if dist.is_available() and dist.is_initialized():
-            for t in [ttt_loss_sum, ttt_token_count, ttt_byte_count]:
-                dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            if ci % 100 == 0 or ci == n_chunks - 1:
+                el = time.perf_counter() - t_ttt
+                eta = el / (ci + 1) * (n_chunks - ci - 1)
+                tok_s = float(ttt_token_count) / max(el, 1e-9)
+                log0(f"ttt {ci+1}/{n_chunks} time:{el:.0f}s eta:{eta:.0f}s tok/s:{tok_s:.0f} lr:{cos_lr:.5f}")
+        # Restore initial weights (TTT should not permanently modify model)
+        base_model.load_state_dict(ttt_init_sd, strict=True)
+        for p in base_model.parameters():
+            p.requires_grad_(True)
         ttt_val_loss = (ttt_loss_sum / ttt_token_count).item()
         ttt_bpt = ttt_val_loss / math.log(2.0)
         ttt_val_bpb = ttt_bpt * ttt_token_count.item() / ttt_byte_count.item()
