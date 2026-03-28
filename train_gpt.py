@@ -373,6 +373,7 @@ INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 GPTQ_CLIP_PERCENTILES = [0.999, 0.9995, 0.9999, 0.99999, 1.0]
+INT8_CLIP_Q = 0.9999  # fixed quantile for QAT fake-quantize (training-time only)
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -389,24 +390,16 @@ def quantize_float_tensor(t: Tensor, bits: int = 8) -> tuple[Tensor, Tensor]:
     max_val = 2 ** (bits - 1) - 1
     t32 = t.float()
     if t32.ndim == 2 and t32.numel() > 0:
-        best_q = None
-        best_scale = None
-        best_mse = torch.full((t32.shape[0],), float("inf"))
+        best_q, best_scale, best_mse = None, None, float("inf")
         for pct in GPTQ_CLIP_PERCENTILES:
-            clip_abs = torch.quantile(t32.abs(), pct, dim=1)
+            clip_abs = torch.quantile(t32.abs(), pct, dim=1) if pct < 1.0 else t32.abs().amax(dim=1)
             scale = (clip_abs / max_val).clamp_min(1.0 / max_val)
             clipped = torch.clamp(t32, -clip_abs[:, None], clip_abs[:, None])
             q = torch.clamp(torch.round(clipped / scale[:, None]), -max_val, max_val).to(torch.int8)
             recon = q.float() * scale[:, None]
-            mse = (t32 - recon).pow(2).mean(dim=1)
-            improved = mse < best_mse
-            if improved.any():
-                if best_q is None:
-                    best_q, best_scale, best_mse = q.clone(), scale.clone(), mse.clone()
-                else:
-                    best_q[improved] = q[improved]
-                    best_scale[improved] = scale[improved]
-                    best_mse[improved] = mse[improved]
+            mse = (t32 - recon).pow(2).mean().item()
+            if mse < best_mse:
+                best_q, best_scale, best_mse = q, scale, mse
         return best_q.contiguous(), best_scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
     if t32.ndim == 2:
         return torch.zeros_like(t32, dtype=torch.int8), torch.empty((t32.shape[0],), dtype=INT8_PER_ROW_SCALE_DTYPE)
@@ -1051,7 +1044,7 @@ def main() -> None:
     swa_count = 0
     ema_state: dict[str, Tensor] | None = None
     if args.ema_decay > 0:
-        ema_state = {n: t.detach().cpu().clone() for n, t in base_model.state_dict().items()}
+        ema_state = {n: t.detach().cpu().float().clone() for n, t in base_model.state_dict().items()}
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params} swa_frac:{args.swa_frac} swa_every:{args.swa_every} quant_bits:{args.quant_bits}")
@@ -1206,7 +1199,7 @@ def main() -> None:
             with torch.no_grad():
                 d = args.ema_decay
                 for n, t in base_model.state_dict().items():
-                    ema_state[n].lerp_(t.detach().cpu(), 1.0 - d)
+                    ema_state[n].lerp_(t.detach().cpu().float(), 1.0 - d)
 
         # Norm diagnostics every 500 steps
         if step % 500 == 0 and step > 0:
@@ -1362,6 +1355,10 @@ def main() -> None:
         ttt_token_count = torch.zeros((), device=device, dtype=torch.float64)
         ttt_byte_count = torch.zeros((), device=device, dtype=torch.float64)
         for ci in range(n_chunks):
+            # Cosine LR decay across chunks
+            cos_lr = args.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ci / max(n_chunks - 1, 1)))
+            for pg in ttt_opt.param_groups:
+                pg["lr"] = cos_lr
             start = ci * chunk_tokens
             chunk = val_tokens[start:start + chunk_tokens + 1].to(device=device, dtype=torch.int64)
             # Score first (no gradient)
@@ -1389,6 +1386,7 @@ def main() -> None:
                         adapt_loss = base_model(x_t, y_t)
                     ttt_opt.zero_grad()
                     adapt_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(base_model.parameters(), 1.0)
                     ttt_opt.step()
         if dist.is_available() and dist.is_initialized():
             for t in [ttt_loss_sum, ttt_token_count, ttt_byte_count]:
