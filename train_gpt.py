@@ -158,6 +158,28 @@ class Muon(torch.optim.Optimizer):
             params,
             dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
         )
+        # Precompute per-param offsets and shape buckets (fixed after init)
+        self._precomputed = False
+
+    def _precompute(self, world_size: int, rank: int) -> None:
+        for group in self.param_groups:
+            params = group["params"]
+            offsets: list[int] = []
+            shape_buckets: dict[tuple[int, int], list[tuple[int, int]]] = {}
+            curr = 0
+            for i, p in enumerate(params):
+                offsets.append(curr)
+                if i % world_size == rank and p.ndim == 2:
+                    sk = (p.size(0), p.size(1))
+                    if sk not in shape_buckets:
+                        shape_buckets[sk] = []
+                    shape_buckets[sk].append((i, curr))
+                curr += p.numel()
+            group["_offsets"] = offsets
+            group["_total_numel"] = curr
+            group["_shape_buckets"] = shape_buckets
+            group["_scale_cache"] = {sk: max(1, sk[0] / sk[1]) ** 0.5 for sk in shape_buckets}
+        self._precomputed = True
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -169,6 +191,8 @@ class Muon(torch.optim.Optimizer):
         distributed = dist.is_available() and dist.is_initialized()
         world_size = dist.get_world_size() if distributed else 1
         rank = dist.get_rank() if distributed else 0
+        if not self._precomputed:
+            self._precompute(world_size, rank)
 
         for group in self.param_groups:
             params = group["params"]
@@ -179,12 +203,11 @@ class Muon(torch.optim.Optimizer):
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
 
-            total_params = sum(int(p.numel()) for p in params)
-            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+            total_numel = group["_total_numel"]
+            updates_flat = torch.zeros(total_numel, device=params[0].device, dtype=torch.bfloat16)
 
-            # Momentum + Nesterov, then collect grads by shape for batched NS
-            grads_by_shape: dict[tuple[int, int], list[tuple[int, Tensor]]] = {}
-            curr = 0
+            # Momentum + Nesterov per rank-local param
+            grad_tensors: dict[int, Tensor] = {}
             for i, p in enumerate(params):
                 if i % world_size == rank and p.grad is not None:
                     g = p.grad
@@ -195,18 +218,16 @@ class Muon(torch.optim.Optimizer):
                     buf.mul_(momentum).add_(g)
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
-                    shape_key = (g.size(0), g.size(1))
-                    if shape_key not in grads_by_shape:
-                        grads_by_shape[shape_key] = []
-                    grads_by_shape[shape_key].append((curr, g))
-                curr += p.numel()
+                    grad_tensors[i] = g
 
-            # Batched Newton-Schulz per shape bucket
-            for shape_key, items in grads_by_shape.items():
+            # Batched Newton-Schulz per precomputed shape bucket
+            for shape_key, bucket in group["_shape_buckets"].items():
+                items = [(off, grad_tensors[i]) for i, off in bucket if i in grad_tensors]
+                if not items:
+                    continue
                 batch = torch.stack([g for _, g in items])
                 ortho = zeropower_via_newtonschulz5_batched(batch, steps=backend_steps)
-                scale = max(1, shape_key[0] / shape_key[1]) ** 0.5
-                ortho *= scale
+                ortho *= group["_scale_cache"][shape_key]
                 for idx, (off, _) in enumerate(items):
                     numel = ortho[idx].numel()
                     updates_flat[off : off + numel] = ortho[idx].reshape(-1)
@@ -216,13 +237,13 @@ class Muon(torch.optim.Optimizer):
                 dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
 
             wd = group.get("wd", 0.0)
-            curr = 0
-            for p in params:
-                g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+            offsets = group["_offsets"]
+            for i, p in enumerate(params):
+                off = offsets[i]
+                g = updates_flat[off : off + p.numel()].view_as(p).to(dtype=p.dtype)
                 p.add_(g, alpha=-lr)
                 if wd > 0:
                     p.data.mul_(1.0 - lr * wd)
-                curr += p.numel()
 
         return loss
 
@@ -755,7 +776,7 @@ class SmearGate(nn.Module):
         self.gate = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
     def forward(self, x: Tensor) -> Tensor:
         g = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
-        x_prev = torch.cat([torch.zeros_like(x[:, :1]), x[:, :-1]], dim=1)
+        x_prev = F.pad(x[:, :-1], (0, 0, 1, 0))
         return (1 - g) * x + g * x_prev
 
 
@@ -1269,10 +1290,10 @@ def main() -> None:
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
-        # Needed to sync whether we've reached the wallclock cap.
+        # Sync wallclock cap only when a rank actually hits it (avoids all_reduce every step)
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
-        if distributed and max_wallclock_ms is not None:
-            reached_cap_tensor = torch.tensor(int(reached_cap), device=device)
+        if distributed and max_wallclock_ms is not None and reached_cap:
+            reached_cap_tensor = torch.tensor(1, device=device)
             dist.all_reduce(reached_cap_tensor, op=dist.ReduceOp.MAX)
             reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
