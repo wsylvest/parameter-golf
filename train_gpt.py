@@ -101,6 +101,7 @@ class Hyperparameters:
     qat_start_frac = float(os.environ.get("QAT_START_FRAC", 0.0))
     swa_frac = float(os.environ.get("SWA_FRAC", 0.0))
     swa_every = int(os.environ.get("SWA_EVERY", 100))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.0))
     neural_temp = float(os.environ.get("NEURAL_TEMP", 0.85))
 
 # -----------------------------
@@ -1013,6 +1014,9 @@ def main() -> None:
     _QUANT_BITS_QAT = args.quant_bits
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
+    ema_state: dict[str, Tensor] | None = None
+    if args.ema_decay > 0:
+        ema_state = {n: t.detach().cpu().clone() for n, t in base_model.state_dict().items()}
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params} swa_frac:{args.swa_frac} swa_every:{args.swa_every} quant_bits:{args.quant_bits}")
@@ -1163,6 +1167,12 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
+        if ema_state is not None:
+            with torch.no_grad():
+                d = args.ema_decay
+                for n, t in base_model.state_dict().items():
+                    ema_state[n].lerp_(t.detach().cpu(), 1.0 - d)
+
         # Norm diagnostics every 500 steps
         if step % 500 == 0 and step > 0:
             with torch.no_grad():
@@ -1214,11 +1224,15 @@ def main() -> None:
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
-    # Save non-SWA checkpoint first
+    # Save raw checkpoint first
     if master_process:
         torch.save(base_model.state_dict(), "final_model_noswa.pt")
-        log0(f"saved non-SWA checkpoint: {os.path.getsize('final_model_noswa.pt')} bytes")
-    if swa_count > 1:
+        log0(f"saved raw checkpoint: {os.path.getsize('final_model_noswa.pt')} bytes")
+    if ema_state is not None:
+        ema_sd = {n: t.to(base_model.state_dict()[n].dtype) for n, t in ema_state.items()}
+        base_model.load_state_dict(ema_sd, strict=True)
+        log0(f"using EMA weights for export (decay={args.ema_decay})")
+    elif swa_count > 1:
         avg = {n: (t / swa_count).to(base_model.state_dict()[n].dtype) for n, t in swa_state.items()}
         base_model.load_state_dict(avg, strict=True)
         log0(f"using SWA weights for export (averaged {swa_count} checkpoints)")

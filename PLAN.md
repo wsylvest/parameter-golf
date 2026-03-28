@@ -1,7 +1,39 @@
 ABOUTME: This file tracks the current implementation plan for parameter-golf competitive improvements.
 ABOUTME: It is used by Claude Code to maintain phase-by-phase execution state.
 
-# Phase 0: Clean Neural Baseline
+# Phase 1: Add EMA
+
+## Verified Facts
+- SWA already implemented (accumulates checkpoints during warmdown, averages at export)
+- Top submissions use EMA(0.997) every step, which provides smoother weight averaging than SWA
+- SWA and EMA can coexist — EMA runs every step, SWA samples during warmdown
+- EMA state must be on CPU to avoid doubling GPU memory
+- 1307 lines currently, 193 available
+
+## Assumptions
+- EMA(0.997) decay is the right starting point (matches top submissions)
+- EMA weights should be preferred over SWA when both are available (EMA is every-step, SWA is periodic)
+- EMA update cost is negligible (CPU copy every step)
+
+## Plan
+1. Add EMA_DECAY hyperparameter (default 0.0 = disabled)
+2. Initialize EMA shadow dict after model setup
+3. Update EMA every step after optimizer.step()
+4. At export time: prefer EMA weights over raw weights (SWA still available as alternative)
+5. ~15 lines added
+
+## Files to Change
+- train_gpt.py — Hyperparameters, training loop, export selection
+
+## Acceptance Criteria
+- EMA_DECAY=0 produces identical behavior to current code
+- EMA_DECAY=0.997 accumulates shadow weights and uses them at export
+- Syntax check passes
+- Line count <= 1325
+
+---
+
+# Phase 0: Clean Neural Baseline (COMPLETE)
 
 ## Verified Facts
 - train_gpt.py at HEAD (403ec72): 1487 lines (13 remaining of 1500 limit)

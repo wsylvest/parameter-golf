@@ -13,3 +13,13 @@ ABOUTME: It is used by Claude Code to track metrics, deltas, and keep/revert dec
 - Neural eval: unchanged (cache was default-off, NGRAM_CACHE=0)
 - Artifact size: unchanged (cache was eval-only, never serialized)
 - Decision: **KEEP**
+
+## Phase 1: Add EMA
+- Status: COMPLETE
+- Baseline: 1307 lines (Phase 0)
+- New: 1321 lines (+14)
+- Added: EMA_DECAY env var (default 0.0 = disabled), shadow weight tracking, export preference EMA > SWA > raw
+- EMA update: `ema[n].lerp_(param.cpu(), 1 - decay)` every step after optimizer
+- EMA init: copies model state_dict to CPU at training start
+- Export: EMA weights loaded into model before quantization/serialization
+- Decision: **KEEP**
