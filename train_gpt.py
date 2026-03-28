@@ -182,6 +182,8 @@ class Muon(torch.optim.Optimizer):
             total_params = sum(int(p.numel()) for p in params)
             updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
 
+            # Momentum + Nesterov, then collect grads by shape for batched NS
+            grads_by_shape: dict[tuple[int, int], list[tuple[int, Tensor]]] = {}
             curr = 0
             for i, p in enumerate(params):
                 if i % world_size == rank and p.grad is not None:
@@ -193,12 +195,22 @@ class Muon(torch.optim.Optimizer):
                     buf.mul_(momentum).add_(g)
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
-                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
-                    Muon.ns_calls += 1
-                    # Scale correction from Muon reference implementations.
-                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
-                    updates_flat[curr : curr + p.numel()] = g.reshape(-1)
+                    shape_key = (g.size(0), g.size(1))
+                    if shape_key not in grads_by_shape:
+                        grads_by_shape[shape_key] = []
+                    grads_by_shape[shape_key].append((curr, g))
                 curr += p.numel()
+
+            # Batched Newton-Schulz per shape bucket
+            for shape_key, items in grads_by_shape.items():
+                batch = torch.stack([g for _, g in items])
+                ortho = zeropower_via_newtonschulz5_batched(batch, steps=backend_steps)
+                scale = max(1, shape_key[0] / shape_key[1]) ** 0.5
+                ortho *= scale
+                for idx, (off, _) in enumerate(items):
+                    numel = ortho[idx].numel()
+                    updates_flat[off : off + numel] = ortho[idx].reshape(-1)
+                Muon.ns_calls += 1
 
             if distributed:
                 dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
@@ -893,11 +905,12 @@ class GPT(nn.Module):
 # -----------------------------
 
 def main() -> None:
-    global zeropower_via_newtonschulz5
+    global zeropower_via_newtonschulz5, zeropower_via_newtonschulz5_batched
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    zeropower_via_newtonschulz5_batched = torch.compile(zeropower_via_newtonschulz5_batched)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
