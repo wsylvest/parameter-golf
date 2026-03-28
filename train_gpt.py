@@ -104,6 +104,7 @@ class Hyperparameters:
     ema_decay = float(os.environ.get("EMA_DECAY", 0.0))
     neural_temp = float(os.environ.get("NEURAL_TEMP", 0.85))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "0")))
+    rope_dims = int(os.environ.get("ROPE_DIMS", 0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -643,6 +644,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        rope_dims: int = 0,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -654,6 +656,7 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
+        self.rope_dims = rope_dims if rope_dims > 0 else self.head_dim
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
@@ -661,7 +664,7 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.rotary = Rotary(self.rope_dims, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -670,9 +673,10 @@ class CausalSelfAttention(nn.Module):
         v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
+        rd = self.rope_dims
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
+        q = torch.cat((apply_rotary_emb(q[..., :rd], cos, sin), q[..., rd:]), dim=-1)
+        k = torch.cat((apply_rotary_emb(k[..., :rd], cos, sin), k[..., rd:]), dim=-1)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q,
@@ -735,11 +739,12 @@ class Block(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         ln_scale: float = 1.0,
+        rope_dims: int = 0,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, rope_dims=rope_dims)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -760,7 +765,8 @@ class GPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, model_dim: int, num_heads: int,
                  num_kv_heads: int, mlp_mult: int, tie_embeddings: bool, tied_embed_init_std: float,
                  logit_softcap: float, rope_base: float, qk_gain_init: float,
-                 bigram_vocab_size: int = 0, bigram_dim: int = 128, ln_scale: bool = False):
+                 bigram_vocab_size: int = 0, bigram_dim: int = 128,
+                 ln_scale: bool = False, rope_dims: int = 0):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -775,7 +781,7 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList([
             Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
-                  ln_scale=1.0 / (i + 1) ** 0.5 if ln_scale else 1.0)
+                  ln_scale=1.0 / (i + 1) ** 0.5 if ln_scale else 1.0, rope_dims=rope_dims)
             for i in range(num_layers)
         ])
         self.smear_gate = SmearGate(model_dim)
@@ -949,7 +955,8 @@ def main() -> None:
         num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
         tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
-        bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim, ln_scale=args.ln_scale,
+        bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
+        ln_scale=args.ln_scale, rope_dims=args.rope_dims,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
