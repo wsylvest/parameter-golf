@@ -14,6 +14,13 @@ ABOUTME: It is used by Claude Code to track metrics, deltas, and keep/revert dec
 - Artifact size: unchanged (cache was eval-only, never serialized)
 - Decision: **KEEP**
 
+## Phase 2: LeakyReLU(0.5)²
+- Status: COMPLETE
+- Change: `torch.relu(x)` → `F.leaky_relu(x, negative_slope=0.5)` in MLP.forward
+- Lines: 1320 (-1 from removed comment)
+- Rationale: #1 submission uses this, worth -0.003 bpb. Preserves negative gradient flow, eliminates dead neurons.
+- Decision: **KEEP**
+
 ## Phase 1: Add EMA
 - Status: COMPLETE
 - Baseline: 1307 lines (Phase 0)
