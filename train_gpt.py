@@ -1256,10 +1256,11 @@ def main() -> None:
     if master_process:
         torch.save(base_model.state_dict(), "final_model_noswa.pt")
         log0(f"saved raw checkpoint: {os.path.getsize('final_model_noswa.pt')} bytes")
-    if ema_state is not None:
+    ema_ready = ema_state is not None and step >= int(1.0 / (1.0 - args.ema_decay))
+    if ema_ready:
         ema_sd = {n: t.to(base_model.state_dict()[n].dtype) for n, t in ema_state.items()}
         base_model.load_state_dict(ema_sd, strict=True)
-        log0(f"using EMA weights for export (decay={args.ema_decay})")
+        log0(f"using EMA weights for export (decay={args.ema_decay}, steps={step})")
     elif swa_count > 1:
         avg = {n: (t / swa_count).to(base_model.state_dict()[n].dtype) for n, t in swa_state.items()}
         base_model.load_state_dict(avg, strict=True)
