@@ -134,6 +134,8 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
+    ns_calls: int = 0  # Newton-Schulz calls since last counter reset
+
     def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
         super().__init__(
             params,
@@ -175,6 +177,7 @@ class Muon(torch.optim.Optimizer):
                     if nesterov:
                         g = g.add(buf, alpha=momentum)
                     g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+                    Muon.ns_calls += 1
                     # Scale correction from Muon reference implementations.
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
@@ -1211,6 +1214,7 @@ def main() -> None:
                 emb_rms = base_model.tok_emb.weight.float().pow(2).mean().item() ** 0.5
                 near_zero = sum((p.abs() < 1e-6).sum().item() for p in base_model.parameters()) / n_params
                 log0(f"norms emb:{emb_rms:.4f} blocks:[{','.join(norms)}] near_zero:{near_zero:.4f}")
+                log0(f"muon ns_calls_total:{Muon.ns_calls} ns_calls_per_step:{Muon.ns_calls / step:.1f}")
 
         # SWA: accumulate checkpoints during warmdown
         if args.swa_frac > 0 and scale < args.swa_frac and step % args.swa_every == 0:
