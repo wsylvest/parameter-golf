@@ -20,3 +20,11 @@ ABOUTME: It is used by Claude Code to track metrics, deltas, and keep/revert dec
 - Step avg: ~131ms (600000/4581)
 - val_bpb: 1.2099 (sliding window)
 - Artifact: 15.1MB
+
+## Batched Muon Implementation (Phases 1-3)
+- NS calls per step: reduced from 66 (1GPU) / ~8 (8GPU) to ~4 (shape buckets)
+- Implementation: shape-bucket collection + torch.bmm batched NS + torch.compile
+- Lines added: +34 (from 1427 to 1461)
+- Phase 4 (correctness) and Phase 5 (throughput): pending GPU validation
+- Test file: tests/test_batched_ns.py (needs torch to run)
+- Code uploaded to S3 network volume
