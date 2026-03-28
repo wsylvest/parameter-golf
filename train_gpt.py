@@ -106,6 +106,9 @@ class Hyperparameters:
     ln_scale = bool(int(os.environ.get("LN_SCALE", "0")))
     rope_dims = int(os.environ.get("ROPE_DIMS", 0))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 0))
+    ttt_lr = float(os.environ.get("TTT_LR", 0.0))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
+    ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -1344,6 +1347,62 @@ def main() -> None:
             f"eval_seq_len:{args.eval_seq_len} eval_stride:{args.eval_stride}"
         )
         log0(f"final_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
+
+    # Score-First TTT: adapt on already-scored chunks, then re-evaluate
+    if args.ttt_lr > 0:
+        torch.cuda.synchronize()
+        t_ttt = time.perf_counter()
+        chunk_seq = args.train_seq_len
+        chunk_tokens = args.ttt_chunk_tokens
+        n_seqs_per_chunk = chunk_tokens // chunk_seq
+        total_val = val_tokens.numel() - 1
+        n_chunks = total_val // chunk_tokens
+        ttt_opt = torch.optim.SGD(base_model.parameters(), lr=args.ttt_lr, momentum=0.9)
+        ttt_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+        ttt_token_count = torch.zeros((), device=device, dtype=torch.float64)
+        ttt_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+        for ci in range(n_chunks):
+            start = ci * chunk_tokens
+            chunk = val_tokens[start:start + chunk_tokens + 1].to(device=device, dtype=torch.int64)
+            # Score first (no gradient)
+            base_model.eval()
+            with torch.inference_mode():
+                for si in range(n_seqs_per_chunk):
+                    s = si * chunk_seq
+                    x_s, y_s = chunk[s:s + chunk_seq].unsqueeze(0), chunk[s + 1:s + chunk_seq + 1].unsqueeze(0)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        logits_s = base_model.forward_logits(x_s)
+                    loss_s = F.cross_entropy(logits_s.float().reshape(-1, logits_s.size(-1)),
+                                             y_s.reshape(-1), reduction="none").to(torch.float64)
+                    ttt_loss_sum += loss_s.sum()
+                    ttt_token_count += chunk_seq
+                    tb = base_bytes_lut[y_s.reshape(-1)].to(torch.float64)
+                    tb += (has_leading_space_lut[y_s.reshape(-1)] & ~is_boundary_token_lut[x_s.reshape(-1)]).to(torch.float64)
+                    ttt_byte_count += tb.sum()
+            # Then adapt on scored chunk
+            base_model.train()
+            for _ in range(args.ttt_epochs):
+                for si in range(n_seqs_per_chunk):
+                    s = si * chunk_seq
+                    x_t, y_t = chunk[s:s + chunk_seq].unsqueeze(0), chunk[s + 1:s + chunk_seq + 1].unsqueeze(0)
+                    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                        adapt_loss = base_model(x_t, y_t)
+                    ttt_opt.zero_grad()
+                    adapt_loss.backward()
+                    ttt_opt.step()
+        if dist.is_available() and dist.is_initialized():
+            for t in [ttt_loss_sum, ttt_token_count, ttt_byte_count]:
+                dist.all_reduce(t, op=dist.ReduceOp.SUM)
+        ttt_val_loss = (ttt_loss_sum / ttt_token_count).item()
+        ttt_bpt = ttt_val_loss / math.log(2.0)
+        ttt_val_bpb = ttt_bpt * ttt_token_count.item() / ttt_byte_count.item()
+        torch.cuda.synchronize()
+        log0(
+            f"ttt val_loss:{ttt_val_loss:.4f} val_bpb:{ttt_val_bpb:.4f} "
+            f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms "
+            f"chunks:{n_chunks} epochs:{args.ttt_epochs} lr:{args.ttt_lr}"
+        )
+        log0(f"ttt_exact val_loss:{ttt_val_loss:.8f} val_bpb:{ttt_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
