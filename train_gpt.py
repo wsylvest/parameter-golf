@@ -133,6 +133,23 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
     return X.T if transposed else X
 
 
+def zeropower_via_newtonschulz5_batched(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
+    # Batched Newton-Schulz for [B, M, N] tensors. Uses torch.bmm.
+    assert G.ndim == 3, f"Expected 3D tensor, got {G.ndim}D"
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    norms = X.norm(dim=(1, 2), keepdim=True)
+    X = X / (norms + eps)
+    transposed = X.size(1) > X.size(2)
+    if transposed:
+        X = X.transpose(1, 2)
+    for _ in range(steps):
+        A = torch.bmm(X, X.transpose(1, 2))
+        B = b * A + c * torch.bmm(A, A)
+        X = a * X + torch.bmm(B, X)
+    return X.transpose(1, 2) if transposed else X
+
+
 class Muon(torch.optim.Optimizer):
     ns_calls: int = 0  # Newton-Schulz calls since last counter reset
 
