@@ -764,13 +764,7 @@ class GPT(nn.Module):
         if self.lm_head is not None:
             self.lm_head._zero_init = True
         self._init_weights()
-        # Pre-slice bank views for compiler-friendly access (no dynamic indexing in forward)
-        self._w_q = [self.bank_sq[2 * i] for i in range(num_layers)]
-        self._w_ap = [self.bank_sq[2 * i + 1] for i in range(num_layers)]
-        self._w_k = [self.bank_kv[2 * i] for i in range(num_layers)]
-        self._w_v = [self.bank_kv[2 * i + 1] for i in range(num_layers)]
-        self._w_fc = [self.bank_fc[i] for i in range(num_layers)]
-        self._w_mp = [self.bank_pr[i] for i in range(num_layers)]
+        self._slices_ready = False
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -788,6 +782,17 @@ class GPT(nn.Module):
                     nn.init.orthogonal_(module.weight, gain=1.0)
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
+
+    def _ensure_slices(self) -> None:
+        if not self._slices_ready:
+            n = self.num_layers
+            self._w_q = [self.bank_sq[2*i] for i in range(n)]
+            self._w_ap = [self.bank_sq[2*i+1] for i in range(n)]
+            self._w_k = [self.bank_kv[2*i] for i in range(n)]
+            self._w_v = [self.bank_kv[2*i+1] for i in range(n)]
+            self._w_fc = [self.bank_fc[i] for i in range(n)]
+            self._w_mp = [self.bank_pr[i] for i in range(n)]
+            self._slices_ready = True
 
     def _run_blocks(self, x: Tensor) -> Tensor:
         x = self.smear_gate(x)
@@ -977,6 +982,7 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    base_model._ensure_slices()
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False,
                            gradient_as_bucket_view=True) if distributed else compiled_model
