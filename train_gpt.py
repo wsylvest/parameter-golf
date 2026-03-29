@@ -872,9 +872,11 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    # Inductor compiler optimizations: cache compiled kernels, auto-tune tile sizes, fuse aggressively
+    # Inductor compiler optimizations
     torch._inductor.config.fx_graph_cache = True
     torch._inductor.config.coordinate_descent_tuning = True
+    if hasattr(torch.compiler, "set_stance"):
+        torch.compiler.set_stance("eager_on_recompile")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
     zeropower_via_newtonschulz5_batched = torch.compile(zeropower_via_newtonschulz5_batched)
 
