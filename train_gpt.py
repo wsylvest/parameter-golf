@@ -764,6 +764,13 @@ class GPT(nn.Module):
         if self.lm_head is not None:
             self.lm_head._zero_init = True
         self._init_weights()
+        # Pre-slice bank views for compiler-friendly access (no dynamic indexing in forward)
+        self._w_q = [self.bank_sq[2 * i] for i in range(num_layers)]
+        self._w_ap = [self.bank_sq[2 * i + 1] for i in range(num_layers)]
+        self._w_k = [self.bank_kv[2 * i] for i in range(num_layers)]
+        self._w_v = [self.bank_kv[2 * i + 1] for i in range(num_layers)]
+        self._w_fc = [self.bank_fc[i] for i in range(num_layers)]
+        self._w_mp = [self.bank_pr[i] for i in range(num_layers)]
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -787,15 +794,15 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0, self.bank_sq[2*i], self.bank_kv[2*i], self.bank_kv[2*i+1],
-                               self.bank_sq[2*i+1], self.bank_fc[i], self.bank_pr[i])
+            x = self.blocks[i](x, x0, self._w_q[i], self._w_k[i], self._w_v[i],
+                               self._w_ap[i], self._w_fc[i], self._w_mp[i])
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             j = self.num_encoder_layers + i
-            x = self.blocks[j](x, x0, self.bank_sq[2*j], self.bank_kv[2*j], self.bank_kv[2*j+1],
-                               self.bank_sq[2*j+1], self.bank_fc[j], self.bank_pr[j])
+            x = self.blocks[j](x, x0, self._w_q[j], self._w_k[j], self._w_v[j],
+                               self._w_ap[j], self._w_fc[j], self._w_mp[j])
         return self.final_norm(x)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
