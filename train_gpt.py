@@ -159,6 +159,10 @@ class Muon(torch.optim.Optimizer):
         super().__init__(params, dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov))
         self._precomputed = False
 
+    def load_state_dict(self, state_dict: dict) -> None:
+        super().load_state_dict(state_dict)
+        self._precomputed = False
+
     def _precompute(self) -> None:
         for group in self.param_groups:
             buckets: dict[tuple[int, int], list[int]] = {}
@@ -166,8 +170,6 @@ class Muon(torch.optim.Optimizer):
             for i, p in enumerate(params):
                 if p.ndim == 2:
                     buckets.setdefault((p.size(0), p.size(1)), []).append(i)
-                    if "momentum_buffer" not in self.state[p]:
-                        self.state[p]["momentum_buffer"] = torch.zeros_like(p)
             banks = {s: torch.zeros(len(idxs), s[0], s[1], dtype=torch.bfloat16, device=params[0].device)
                      for s, idxs in buckets.items()}
             group["_buckets"] = buckets
@@ -192,7 +194,10 @@ class Muon(torch.optim.Optimizer):
                 if p.grad is None or p.ndim != 2:
                     continue
                 g = p.grad
-                buf = self.state[p]["momentum_buffer"]
+                state = self.state[p]
+                if "momentum_buffer" not in state:
+                    state["momentum_buffer"] = torch.zeros_like(g)
+                buf = state["momentum_buffer"]
                 buf.mul_(mom).add_(g)
                 self.state[p]["_ns_grad"] = g.add(buf, alpha=mom) if nesterov else buf.clone()
             # Gather → batched NS → scatter per shape bucket
