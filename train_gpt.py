@@ -89,7 +89,7 @@ class Hyperparameters:
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
-    muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
+    muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 3))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
     beta1 = float(os.environ.get("BETA1", 0.9))
@@ -186,7 +186,8 @@ class Muon(torch.optim.Optimizer):
                           "_local_indices": local_indices, "_shape_buckets": shape_buckets,
                           "_bucket_numels": {sk: sk[0] * sk[1] for sk in shape_buckets},
                           "_scale_cache": {sk: max(1, sk[0] / sk[1]) ** 0.5 for sk in shape_buckets},
-                          "_grad_list": [None] * len(params)})
+                          "_grad_list": [None] * len(params),
+                          "_updates_flat": torch.zeros(curr, device=params[0].device, dtype=torch.bfloat16)})
         self._precomputed = True
 
     @torch.no_grad()
@@ -209,7 +210,8 @@ class Muon(torch.optim.Optimizer):
             wd = group.get("wd", 0.0)
             wd_factor = (1.0 - lr * wd) if wd > 0 else 0.0
 
-            updates_flat = torch.zeros(group["_total_numel"], device=params[0].device, dtype=torch.bfloat16)
+            updates_flat = group["_updates_flat"]
+            updates_flat.zero_()
             grad_list = group["_grad_list"]
 
             # Momentum + Nesterov for rank-local params
@@ -970,7 +972,7 @@ def main() -> None:
     torch.backends.cudnn.allow_tf32 = True
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
 
-    enable_cudnn_sdp(False)
+    enable_cudnn_sdp(True)
     enable_flash_sdp(True)
     enable_mem_efficient_sdp(False)
     enable_math_sdp(False)
@@ -1043,7 +1045,8 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False,
+                           gradient_as_bucket_view=True, static_graph=True) if distributed else compiled_model
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
@@ -1109,7 +1112,7 @@ def main() -> None:
     ema_names: list[tuple[str, nn.Parameter]] | None = None
     ema_alpha = 1.0 - args.ema_decay
     if args.ema_decay > 0:
-        ema_state = {n: t.detach().cpu().float().clone() for n, t in base_model.state_dict().items()}
+        ema_state = {n: t.detach().float().clone() for n, t in base_model.state_dict().items()}
         ema_names = list(base_model.named_parameters()) + list(base_model.named_buffers())
 
     n_params = sum(p.numel() for p in base_model.parameters())
@@ -1265,7 +1268,7 @@ def main() -> None:
         if ema_state is not None:
             with torch.no_grad():
                 for n, t in ema_names:
-                    ema_state[n].lerp_(t.to(device="cpu", dtype=torch.float32), ema_alpha)
+                    ema_state[n].lerp_(t.float(), ema_alpha)
 
         # Norm diagnostics every 500 steps
         if step % 500 == 0 and step > 0:
@@ -1325,7 +1328,7 @@ def main() -> None:
         log0(f"saved raw checkpoint: {os.path.getsize('final_model_noswa.pt')} bytes")
     ema_ready = ema_state is not None and step >= int(1.0 / (1.0 - args.ema_decay))
     if ema_ready:
-        ema_sd = {n: t.to(base_model.state_dict()[n].dtype) for n, t in ema_state.items()}
+        ema_sd = {n: t.to(dtype=base_model.state_dict()[n].dtype, device=base_model.state_dict()[n].device) for n, t in ema_state.items()}
         base_model.load_state_dict(ema_sd, strict=True)
         log0(f"using EMA weights for export (decay={args.ema_decay}, steps={step})")
     elif swa_count > 1:
