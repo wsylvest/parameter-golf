@@ -157,6 +157,23 @@ class Muon(torch.optim.Optimizer):
 
     def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
         super().__init__(params, dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov))
+        self._precomputed = False
+
+    def _precompute(self) -> None:
+        for group in self.param_groups:
+            buckets: dict[tuple[int, int], list[int]] = {}
+            params = group["params"]
+            for i, p in enumerate(params):
+                if p.ndim == 2:
+                    buckets.setdefault((p.size(0), p.size(1)), []).append(i)
+                    if "momentum_buffer" not in self.state[p]:
+                        self.state[p]["momentum_buffer"] = torch.zeros_like(p)
+            banks = {s: torch.zeros(len(idxs), s[0], s[1], dtype=torch.bfloat16, device=params[0].device)
+                     for s, idxs in buckets.items()}
+            group["_buckets"] = buckets
+            group["_banks"] = banks
+            group["_scales"] = {s: max(1, s[0] / s[1]) ** 0.5 for s in buckets}
+        self._precomputed = True
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -164,31 +181,42 @@ class Muon(torch.optim.Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
+        if not self._precomputed:
+            self._precompute()
         for group in self.param_groups:
             lr, mom, bs = group["lr"], group["momentum"], group["backend_steps"]
             nesterov, wd = group["nesterov"], group.get("wd", 0.0)
-            for p in group["params"]:
-                if p.grad is None:
+            params = group["params"]
+            # Momentum + Nesterov on individual params
+            for i, p in enumerate(params):
+                if p.grad is None or p.ndim != 2:
                     continue
                 g = p.grad
-                state = self.state[p]
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
-                buf = state["momentum_buffer"]
+                buf = self.state[p]["momentum_buffer"]
                 buf.mul_(mom).add_(g)
-                g = g.add(buf, alpha=mom) if nesterov else buf
-                if g.ndim == 3:
-                    u = zeropower_via_newtonschulz5_batched(g, steps=bs)
-                    u *= max(1, g.size(1) / g.size(2)) ** 0.5
-                elif g.ndim == 2:
-                    u = zeropower_via_newtonschulz5(g, steps=bs)
-                    u *= max(1, g.size(0) / g.size(1)) ** 0.5
-                else:
-                    u = g
+                self.state[p]["_ns_grad"] = g.add(buf, alpha=mom) if nesterov else buf.clone()
+            # Gather → batched NS → scatter per shape bucket
+            for shape, idxs in group["_buckets"].items():
+                bank = group["_banks"][shape]
+                active = []
+                for slot, pi in enumerate(idxs):
+                    ns_g = self.state[params[pi]].get("_ns_grad")
+                    if ns_g is not None:
+                        bank[slot].copy_(ns_g)
+                        active.append((slot, pi))
+                    else:
+                        bank[slot].zero_()
+                if not active:
+                    continue
+                ortho = zeropower_via_newtonschulz5_batched(bank, steps=bs)
+                ortho *= group["_scales"][shape]
                 Muon.ns_calls += 1
-                p.add_(u.to(p.dtype), alpha=-lr)
-                if wd > 0:
-                    p.data.mul_(1.0 - lr * wd)
+                for slot, pi in active:
+                    p = params[pi]
+                    p.add_(ortho[slot].to(p.dtype), alpha=-lr)
+                    if wd > 0:
+                        p.data.mul_(1.0 - lr * wd)
+                    self.state[p].pop("_ns_grad", None)
         return loss
 
 
@@ -641,28 +669,30 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 
-def _fq(w: Tensor) -> Tensor:
-    # Apply fake quantization for QAT if enabled, otherwise passthrough.
-    if CastedLinear.qat_enabled and w.requires_grad and w.numel() > INT8_KEEP_FLOAT_MAX_NUMEL:
-        return _fake_quantize(w)
-    return w
-
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
                  qk_gain_init: float, rope_dims: int = 0, use_xsa: bool = False):
         super().__init__()
+        if dim % num_heads != 0:
+            raise ValueError("model_dim must be divisible by num_heads")
         self.num_heads, self.num_kv_heads = num_heads, num_kv_heads
         self.head_dim = dim // num_heads
         self.use_xsa = use_xsa
         self.rope_dims = rope_dims if rope_dims > 0 else self.head_dim
+        kv_dim = num_kv_heads * self.head_dim
+        self.c_q = CastedLinear(dim, dim, bias=False)
+        self.c_k = CastedLinear(dim, kv_dim, bias=False)
+        self.c_v = CastedLinear(dim, kv_dim, bias=False)
+        self.proj = CastedLinear(dim, dim, bias=False)
+        self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.rope_dims, base=rope_base)
 
-    def forward(self, x: Tensor, w_q: Tensor, w_k: Tensor, w_v: Tensor, w_proj: Tensor) -> Tensor:
+    def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
-        q = F.linear(x, _fq(w_q)).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        k = F.linear(x, _fq(w_k)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = F.linear(x, _fq(w_v)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
         rd = self.rope_dims
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
@@ -676,7 +706,18 @@ class CausalSelfAttention(nn.Module):
             v_n = F.normalize(v_exp, dim=-1)
             y = y - (y * v_n).sum(dim=-1, keepdim=True) * v_n
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-        return F.linear(y, _fq(w_proj))
+        return self.proj(y)
+
+
+class MLP(nn.Module):
+    def __init__(self, dim: int, mlp_mult: int):
+        super().__init__()
+        self.fc = CastedLinear(dim, mlp_mult * dim, bias=False)
+        self.proj = CastedLinear(mlp_mult * dim, dim, bias=False)
+        self.proj._zero_init = True
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.proj(F.leaky_relu(self.fc(x), negative_slope=0.5).square())
 
 
 class SmearGate(nn.Module):
@@ -706,27 +747,27 @@ class BigramHashEmbedding(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float,
-                 qk_gain_init: float, ln_scale: float = 1.0, rope_dims: int = 0, use_xsa: bool = False):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
+                 rope_base: float, qk_gain_init: float, ln_scale: float = 1.0,
+                 rope_dims: int = 0, use_xsa: bool = False):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
                                         rope_dims=rope_dims, use_xsa=use_xsa)
+        self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
         self.ln_scale = ln_scale
 
-    def forward(self, x: Tensor, x0: Tensor, w_q: Tensor, w_k: Tensor, w_v: Tensor,
-                w_aproj: Tensor, w_fc: Tensor, w_mproj: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         s = self.ln_scale
-        attn_out = self.attn(self.attn_norm(x) * s, w_q, w_k, w_v, w_aproj)
+        attn_out = self.attn(self.attn_norm(x) * s)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        mlp_h = F.leaky_relu(F.linear(self.mlp_norm(x) * s, _fq(w_fc)), negative_slope=0.5)
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * F.linear(mlp_h.square(), _fq(w_mproj))
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x) * s)
         return x
 
 
@@ -741,20 +782,13 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.num_layers = num_layers
-        kv_dim = (num_kv_heads * model_dim) // num_heads
-        hidden = mlp_mult * model_dim
-        # Parameter banks: contiguous 3D tensors for batched Muon Newton-Schulz
-        self.bank_sq = nn.Parameter(torch.empty(2 * num_layers, model_dim, model_dim))
-        self.bank_kv = nn.Parameter(torch.empty(2 * num_layers, kv_dim, model_dim))
-        self.bank_fc = nn.Parameter(torch.empty(num_layers, hidden, model_dim))
-        self.bank_pr = nn.Parameter(torch.empty(num_layers, model_dim, hidden))
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList([
-            Block(model_dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
+            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
                   ln_scale=1.0 / (i + 1) ** 0.5 if ln_scale else 1.0, rope_dims=rope_dims,
                   use_xsa=(i >= num_layers - xsa_last_n))
             for i in range(num_layers)
@@ -766,18 +800,10 @@ class GPT(nn.Module):
         if self.lm_head is not None:
             self.lm_head._zero_init = True
         self._init_weights()
-        self._slices_ready = False
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
-        for i in range(self.num_layers):
-            nn.init.orthogonal_(self.bank_sq.data[2 * i], gain=1.0)      # c_q
-            nn.init.zeros_(self.bank_sq.data[2 * i + 1])                   # attn.proj (zero_init)
-            nn.init.orthogonal_(self.bank_kv.data[2 * i], gain=1.0)      # c_k
-            nn.init.orthogonal_(self.bank_kv.data[2 * i + 1], gain=1.0)  # c_v
-            nn.init.orthogonal_(self.bank_fc.data[i], gain=1.0)           # mlp.fc
-            nn.init.zeros_(self.bank_pr.data[i])                           # mlp.proj (zero_init)
         for module in self.modules():
             if isinstance(module, nn.Linear) and module.weight.ndim == 2:
                 if min(module.weight.shape) >= 64 and not getattr(module, "_zero_init", False):
@@ -785,39 +811,22 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def _ensure_slices(self) -> None:
-        if not self._slices_ready:
-            n = self.num_layers
-            self._w_q = [self.bank_sq[2*i] for i in range(n)]
-            self._w_ap = [self.bank_sq[2*i+1] for i in range(n)]
-            self._w_k = [self.bank_kv[2*i] for i in range(n)]
-            self._w_v = [self.bank_kv[2*i+1] for i in range(n)]
-            self._w_fc = [self.bank_fc[i] for i in range(n)]
-            self._w_mp = [self.bank_pr[i] for i in range(n)]
-            self._slices_ready = True
-
-    def _run_blocks(self, x: Tensor) -> Tensor:
-        x = self.smear_gate(x)
-        x0 = x
-        skips: list[Tensor] = []
-        for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0, self._w_q[i], self._w_k[i], self._w_v[i],
-                               self._w_ap[i], self._w_fc[i], self._w_mp[i])
-            skips.append(x)
-        for i in range(self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            j = self.num_encoder_layers + i
-            x = self.blocks[j](x, x0, self._w_q[j], self._w_k[j], self._w_v[j],
-                               self._w_ap[j], self._w_fc[j], self._w_mp[j])
-        return self.final_norm(x)
-
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
-        x = self._run_blocks(x).reshape(-1, x.size(-1))
+        x = self.smear_gate(x)
+        x0 = x
+        skips: list[Tensor] = []
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -831,42 +840,22 @@ class GPT(nn.Module):
         if self.bigram is not None:
             x = x + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
-        x = self._run_blocks(x)
+        x = self.smear_gate(x)
+        x0 = x
+        skips: list[Tensor] = []
+        for i in range(self.num_encoder_layers):
+            x = self.blocks[i](x, x0)
+            skips.append(x)
+        for i in range(self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self.blocks[self.num_encoder_layers + i](x, x0)
+        x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             logits_proj = self.lm_head(x)
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-
-    def export_state_dict(self) -> dict[str, Tensor]:
-        sd: dict[str, Tensor] = {}
-        for i in range(self.num_layers):
-            p = f"blocks.{i}"
-            sd[f"{p}.attn.c_q.weight"] = self.bank_sq[2 * i].detach()
-            sd[f"{p}.attn.proj.weight"] = self.bank_sq[2 * i + 1].detach()
-            sd[f"{p}.attn.c_k.weight"] = self.bank_kv[2 * i].detach()
-            sd[f"{p}.attn.c_v.weight"] = self.bank_kv[2 * i + 1].detach()
-            sd[f"{p}.mlp.fc.weight"] = self.bank_fc[i].detach()
-            sd[f"{p}.mlp.proj.weight"] = self.bank_pr[i].detach()
-        for n, t in self.state_dict().items():
-            if not n.startswith("bank_"):
-                sd[n] = t
-        return sd
-
-    def load_export_state_dict(self, sd: dict[str, Tensor]) -> None:
-        with torch.no_grad():
-            for i in range(self.num_layers):
-                p = f"blocks.{i}"
-                self.bank_sq.data[2 * i].copy_(sd[f"{p}.attn.c_q.weight"])
-                self.bank_sq.data[2 * i + 1].copy_(sd[f"{p}.attn.proj.weight"])
-                self.bank_kv.data[2 * i].copy_(sd[f"{p}.attn.c_k.weight"])
-                self.bank_kv.data[2 * i + 1].copy_(sd[f"{p}.attn.c_v.weight"])
-                self.bank_fc.data[i].copy_(sd[f"{p}.mlp.fc.weight"])
-                self.bank_pr.data[i].copy_(sd[f"{p}.mlp.proj.weight"])
-            own = self.state_dict()
-            for k, v in sd.items():
-                if k in own and not k.startswith("bank_"):
-                    own[k].copy_(v)
 
 
 # -----------------------------
@@ -980,30 +969,26 @@ def main() -> None:
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
         ln_scale=args.ln_scale, rope_dims=args.rope_dims, xsa_last_n=args.xsa_last_n,
     ).to(device).bfloat16()
-    # Promote weight matrices to float32 (banks + any remaining CastedLinear like bigram.proj, lm_head)
-    for bank in [base_model.bank_sq, base_model.bank_kv, base_model.bank_fc, base_model.bank_pr]:
-        bank.data = bank.data.float()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    base_model._ensure_slices()
-    log0(f"banks: sq={list(base_model.bank_sq.shape)} kv={list(base_model.bank_kv.shape)} "
-         f"fc={list(base_model.bank_fc.shape)} pr={list(base_model.bank_pr.shape)} grad_accum={grad_accum_steps}")
     compile_kwargs = dict(dynamic=False, fullgraph=True)
     if args.compile_mode != "default":
         compile_kwargs["mode"] = args.compile_mode
-    log0(f"compile: mode={args.compile_mode}")
+    log0(f"compile: mode={args.compile_mode} grad_accum={grad_accum_steps}")
     compiled_model = torch.compile(base_model, **compile_kwargs)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False,
                            gradient_as_bucket_view=True) if distributed else compiled_model
 
-    # Optimizer split:
-    # Optimizer split: banks via Muon, scalars/vectors via Adam
-    bank_params: list[Tensor] = [base_model.bank_sq, base_model.bank_kv, base_model.bank_fc, base_model.bank_pr]
+    # Optimizer split: matrix weights via Muon (gather-scatter), scalars via Adam
+    block_named_params = list(base_model.blocks.named_parameters())
+    matrix_params = [p for n, p in block_named_params
+                     if p.ndim == 2 and not any(pat in n for pat in CONTROL_TENSOR_NAME_PATTERNS)]
+    scalar_params = [p for n, p in block_named_params
+                     if p.ndim < 2 or any(pat in n for pat in CONTROL_TENSOR_NAME_PATTERNS)]
     if base_model.bigram is not None:
-        bank_params.append(base_model.bigram.proj.weight)
-    scalar_params = list(p for n, p in base_model.blocks.named_parameters())
+        matrix_params.append(base_model.bigram.proj.weight)
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     scalar_params.append(base_model.smear_gate.gate)
@@ -1018,7 +1003,7 @@ def main() -> None:
         fused=True,
     )
     optimizer_muon = Muon(
-        bank_params,
+        matrix_params,
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
@@ -1248,8 +1233,7 @@ def main() -> None:
                     norms.append(f"L{bi}:{w_rms:.4f}")
                 emb_rms = base_model.tok_emb.weight.float().pow(2).mean().item() ** 0.5
                 near_zero = sum((p.abs() < 1e-6).sum().item() for p in base_model.parameters()) / n_params
-                bank_rms = sum(b.float().pow(2).mean().item() for b in [base_model.bank_sq, base_model.bank_kv, base_model.bank_fc, base_model.bank_pr]) ** 0.5
-                log0(f"norms emb:{emb_rms:.4f} banks:{bank_rms:.4f} blocks:[{','.join(norms)}] near_zero:{near_zero:.4f}")
+                log0(f"norms emb:{emb_rms:.4f} blocks:[{','.join(norms)}] near_zero:{near_zero:.4f}")
                 log0(f"muon ns_calls_total:{Muon.ns_calls} ns_calls_per_step:{Muon.ns_calls / step:.1f}")
 
         # SWA: accumulate checkpoints during warmdown
@@ -1314,7 +1298,7 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.export_state_dict(), quant_bits=args.quant_bits)
+    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict(), quant_bits=args.quant_bits)
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
@@ -1345,7 +1329,7 @@ def main() -> None:
     except Exception:
         decompressed = zlib.decompress(quant_blob_disk)
     quant_state = torch.load(io.BytesIO(decompressed), map_location="cpu")
-    base_model.load_export_state_dict(dequantize_state_dict_int8(quant_state))
+    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
