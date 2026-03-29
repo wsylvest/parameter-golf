@@ -109,6 +109,7 @@ class Hyperparameters:
     ttt_lr = float(os.environ.get("TTT_LR", 0.0))
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
+    profile_step_every = int(os.environ.get("PROFILE_STEP_EVERY", 0))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -983,6 +984,8 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     base_model._ensure_slices()
+    log0(f"model: {n_params:,} params, banks sq={list(base_model.bank_sq.shape)} kv={list(base_model.bank_kv.shape)} "
+         f"fc={list(base_model.bank_fc.shape)} pr={list(base_model.bank_pr.shape)} grad_accum={grad_accum_steps}")
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False,
                            gradient_as_bucket_view=True) if distributed else compiled_model
@@ -1164,6 +1167,11 @@ def main() -> None:
             qat_frac = elapsed_ms / max_wallclock_ms if max_wallclock_ms else step / max(args.iterations, 1)
             CastedLinear.qat_enabled = qat_frac >= args.qat_start_frac
 
+        do_profile = args.profile_step_every > 0 and step > 0 and step % args.profile_step_every == 0
+        if do_profile:
+            _pev = {k: torch.cuda.Event(enable_timing=True) for k in ("s", "fb", "opt", "ema", "e")}
+            _pev["s"].record()
+
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1175,6 +1183,9 @@ def main() -> None:
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
+
+        if do_profile:
+            _pev["fb"].record()
 
         if args.muon_momentum_warmup_steps > 0 and step <= args.muon_momentum_warmup_steps:
             frac = step / args.muon_momentum_warmup_steps
@@ -1192,10 +1203,33 @@ def main() -> None:
             opt.step()
         zero_grad_all()
 
+        if do_profile:
+            _pev["opt"].record()
+
         if ema_state is not None:
             with torch.no_grad():
                 for n, t in ema_names:
                     ema_state[n].lerp_(t.float(), ema_alpha)
+
+        if do_profile:
+            _pev["ema"].record(); _pev["e"].record(); torch.cuda.synchronize()
+            fb = _pev["s"].elapsed_time(_pev["fb"])
+            opt = _pev["fb"].elapsed_time(_pev["opt"])
+            ema = _pev["opt"].elapsed_time(_pev["ema"])
+            total = _pev["s"].elapsed_time(_pev["e"])
+            misc = total - fb - opt - ema
+            if distributed:
+                vals = torch.tensor([fb, opt, ema, total, misc], device=device)
+                gathered = [torch.zeros_like(vals) for _ in range(world_size)]
+                dist.all_gather(gathered, vals)
+                if master_process:
+                    all_v = torch.stack(gathered)
+                    mx = all_v.max(dim=0).values; mn = all_v.mean(dim=0)
+                    log0(f"profile step={step} fwd+bwd: mean={mn[0]:.1f} max={mx[0]:.1f}  "
+                         f"opt: mean={mn[1]:.1f} max={mx[1]:.1f}  ema: mean={mn[2]:.1f} max={mx[2]:.1f}  "
+                         f"total: mean={mn[3]:.1f} max={mx[3]:.1f}  misc: mean={mn[4]:.1f} max={mx[4]:.1f}")
+            else:
+                log0(f"profile step={step} fwd+bwd:{fb:.1f} opt:{opt:.1f} ema:{ema:.1f} total:{total:.1f} misc:{misc:.1f}")
 
         # Norm diagnostics every 500 steps
         if step % 500 == 0 and step > 0:
