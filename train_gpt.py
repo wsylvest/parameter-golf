@@ -110,6 +110,7 @@ class Hyperparameters:
     ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
     ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
     profile_step_every = int(os.environ.get("PROFILE_STEP_EVERY", 0))
+    compile_mode = os.environ.get("COMPILE_MODE", "default")
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -986,7 +987,11 @@ def main() -> None:
     base_model._ensure_slices()
     log0(f"banks: sq={list(base_model.bank_sq.shape)} kv={list(base_model.bank_kv.shape)} "
          f"fc={list(base_model.bank_fc.shape)} pr={list(base_model.bank_pr.shape)} grad_accum={grad_accum_steps}")
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compile_kwargs = dict(dynamic=False, fullgraph=True)
+    if args.compile_mode != "default":
+        compile_kwargs["mode"] = args.compile_mode
+    log0(f"compile: mode={args.compile_mode}")
+    compiled_model = torch.compile(base_model, **compile_kwargs)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False,
                            gradient_as_bucket_view=True) if distributed else compiled_model
 
