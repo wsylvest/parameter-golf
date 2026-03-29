@@ -658,9 +658,9 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor, w_q: Tensor, w_k: Tensor, w_v: Tensor, w_proj: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
-        q = F.linear(x, _fq(w_q).to(x.dtype)).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        k = F.linear(x, _fq(w_k).to(x.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = F.linear(x, _fq(w_v).to(x.dtype)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        q = F.linear(x, _fq(w_q)).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        k = F.linear(x, _fq(w_k)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        v = F.linear(x, _fq(w_v)).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
         q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
         rd = self.rope_dims
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
@@ -674,7 +674,7 @@ class CausalSelfAttention(nn.Module):
             v_n = F.normalize(v_exp, dim=-1)
             y = y - (y * v_n).sum(dim=-1, keepdim=True) * v_n
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-        return F.linear(y, _fq(w_proj).to(y.dtype))
+        return F.linear(y, _fq(w_proj))
 
 
 class SmearGate(nn.Module):
@@ -723,8 +723,8 @@ class Block(nn.Module):
         s = self.ln_scale
         attn_out = self.attn(self.attn_norm(x) * s, w_q, w_k, w_v, w_aproj)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        mlp_h = F.leaky_relu(F.linear(self.mlp_norm(x) * s, _fq(w_fc).to(x.dtype)), negative_slope=0.5)
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * F.linear(mlp_h.square(), _fq(w_mproj).to(x.dtype))
+        mlp_h = F.leaky_relu(F.linear(self.mlp_norm(x) * s, _fq(w_fc)), negative_slope=0.5)
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * F.linear(mlp_h.square(), _fq(w_mproj))
         return x
 
 
@@ -963,18 +963,18 @@ def main() -> None:
         bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
         ln_scale=args.ln_scale, rope_dims=args.rope_dims, xsa_last_n=args.xsa_last_n,
     ).to(device).bfloat16()
+    # Promote weight matrices to float32 (banks + any remaining CastedLinear like bigram.proj, lm_head)
+    for bank in [base_model.bank_sq, base_model.bank_kv, base_model.bank_fc, base_model.bank_pr]:
+        bank.data = bank.data.float()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False,
-                           gradient_as_bucket_view=True, static_graph=True) if distributed else compiled_model
+                           gradient_as_bucket_view=True) if distributed else compiled_model
 
     # Optimizer split:
-    # Bank params: float32 (matching old CastedLinear weight dtype)
-    for bank in [base_model.bank_sq, base_model.bank_kv, base_model.bank_fc, base_model.bank_pr]:
-        bank.data = bank.data.float()
     # Optimizer split: banks via Muon, scalars/vectors via Adam
     bank_params: list[Tensor] = [base_model.bank_sq, base_model.bank_kv, base_model.bank_fc, base_model.bank_pr]
     if base_model.bigram is not None:
@@ -1027,7 +1027,7 @@ def main() -> None:
     ema_alpha = 1.0 - args.ema_decay
     if args.ema_decay > 0:
         ema_state = {n: t.detach().float().clone() for n, t in base_model.state_dict().items()}
-        ema_names = list(base_model.named_parameters()) + list(base_model.named_buffers())
+        ema_names = [(n, p) for n, p in list(base_model.named_parameters()) + list(base_model.named_buffers()) if n in ema_state]
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params} swa_frac:{args.swa_frac} swa_every:{args.swa_every} quant_bits:{args.quant_bits}")
