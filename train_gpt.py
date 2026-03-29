@@ -978,10 +978,9 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compile_kwargs = dict(dynamic=False, fullgraph=True)
-    if args.compile_mode != "default":
-        compile_kwargs["mode"] = args.compile_mode
-    log0(f"compile: mode={args.compile_mode} grad_accum={grad_accum_steps}")
+    compile_mode = "max-autotune" if args.compile_mode == "default" else args.compile_mode
+    compile_kwargs = dict(dynamic=False, fullgraph=True, mode=compile_mode)
+    log0(f"compile: mode={compile_mode} grad_accum={grad_accum_steps}")
     compiled_model = torch.compile(base_model, **compile_kwargs)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False,
                            gradient_as_bucket_view=True) if distributed else compiled_model
