@@ -793,10 +793,9 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList([
-            torch.compile(Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
+            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
                   ln_scale=1.0 / (i + 1) ** 0.5 if ln_scale else 1.0, rope_dims=rope_dims,
-                  use_xsa=(i >= num_layers - xsa_last_n)),
-                  dynamic=False, fullgraph=True, mode="max-autotune")
+                  use_xsa=(i >= num_layers - xsa_last_n))
             for i in range(num_layers)
         ])
         self.smear_gate = SmearGate(model_dim)
@@ -873,11 +872,9 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    # Inductor compiler optimizations
+    # Inductor compiler optimizations: cache compiled kernels, auto-tune tile sizes, fuse aggressively
     torch._inductor.config.fx_graph_cache = True
     torch._inductor.config.coordinate_descent_tuning = True
-    if hasattr(torch.compiler, "set_stance"):
-        torch.compiler.set_stance("eager_on_recompile")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
     zeropower_via_newtonschulz5_batched = torch.compile(zeropower_via_newtonschulz5_batched)
 
@@ -981,9 +978,12 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    log0(f"compile: regional (per-block max-autotune) grad_accum={grad_accum_steps}")
-    model: nn.Module = DDP(base_model, device_ids=[local_rank], broadcast_buffers=False,
-                           gradient_as_bucket_view=True) if distributed else base_model
+    compile_mode = "max-autotune" if args.compile_mode == "default" else args.compile_mode
+    compile_kwargs = dict(dynamic=False, fullgraph=True, mode=compile_mode)
+    log0(f"compile: mode={compile_mode} grad_accum={grad_accum_steps}")
+    compiled_model = torch.compile(base_model, **compile_kwargs)
+    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False,
+                           gradient_as_bucket_view=True) if distributed else compiled_model
 
     # Optimizer split: matrix weights via Muon (gather-scatter), scalars via Adam
     block_named_params = list(base_model.blocks.named_parameters())
