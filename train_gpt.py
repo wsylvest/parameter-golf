@@ -984,7 +984,7 @@ def main() -> None:
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     base_model._ensure_slices()
-    log0(f"model: {n_params:,} params, banks sq={list(base_model.bank_sq.shape)} kv={list(base_model.bank_kv.shape)} "
+    log0(f"banks: sq={list(base_model.bank_sq.shape)} kv={list(base_model.bank_kv.shape)} "
          f"fc={list(base_model.bank_fc.shape)} pr={list(base_model.bank_pr.shape)} grad_accum={grad_accum_steps}")
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False,
