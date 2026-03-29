@@ -158,27 +158,35 @@ class Muon(torch.optim.Optimizer):
             params,
             dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
         )
-        # Precompute per-param offsets and shape buckets (fixed after init)
         self._precomputed = False
+        self._distributed = False
+        self._world_size = 1
+        self._rank = 0
 
-    def _precompute(self, world_size: int, rank: int) -> None:
+    def _precompute(self) -> None:
+        self._distributed = dist.is_available() and dist.is_initialized()
+        self._world_size = dist.get_world_size() if self._distributed else 1
+        self._rank = dist.get_rank() if self._distributed else 0
+        ws, rk = self._world_size, self._rank
         for group in self.param_groups:
             params = group["params"]
-            offsets: list[int] = []
+            offsets, numels, local_indices = [], [], []
             shape_buckets: dict[tuple[int, int], list[tuple[int, int]]] = {}
             curr = 0
             for i, p in enumerate(params):
-                offsets.append(curr)
-                if i % world_size == rank and p.ndim == 2:
+                offsets.append(curr); numels.append(p.numel())
+                if i % ws == rk and p.ndim == 2:
+                    local_indices.append(i)
                     sk = (p.size(0), p.size(1))
-                    if sk not in shape_buckets:
-                        shape_buckets[sk] = []
-                    shape_buckets[sk].append((i, curr))
+                    shape_buckets.setdefault(sk, []).append((i, curr))
+                    if "momentum_buffer" not in self.state[p]:
+                        self.state[p]["momentum_buffer"] = torch.zeros_like(p)
                 curr += p.numel()
-            group["_offsets"] = offsets
-            group["_total_numel"] = curr
-            group["_shape_buckets"] = shape_buckets
-            group["_scale_cache"] = {sk: max(1, sk[0] / sk[1]) ** 0.5 for sk in shape_buckets}
+            group.update({"_offsets": offsets, "_numels": numels, "_total_numel": curr,
+                          "_local_indices": local_indices, "_shape_buckets": shape_buckets,
+                          "_bucket_numels": {sk: sk[0] * sk[1] for sk in shape_buckets},
+                          "_scale_cache": {sk: max(1, sk[0] / sk[1]) ** 0.5 for sk in shape_buckets},
+                          "_grad_list": [None] * len(params)})
         self._precomputed = True
 
     @torch.no_grad()
@@ -187,12 +195,8 @@ class Muon(torch.optim.Optimizer):
         if closure is not None:
             with torch.enable_grad():
                 loss = closure()
-
-        distributed = dist.is_available() and dist.is_initialized()
-        world_size = dist.get_world_size() if distributed else 1
-        rank = dist.get_rank() if distributed else 0
         if not self._precomputed:
-            self._precompute(world_size, rank)
+            self._precompute()
 
         for group in self.param_groups:
             params = group["params"]
@@ -202,48 +206,53 @@ class Muon(torch.optim.Optimizer):
             momentum = group["momentum"]
             backend_steps = group["backend_steps"]
             nesterov = group["nesterov"]
+            wd = group.get("wd", 0.0)
+            wd_factor = (1.0 - lr * wd) if wd > 0 else 0.0
 
-            total_numel = group["_total_numel"]
-            updates_flat = torch.zeros(total_numel, device=params[0].device, dtype=torch.bfloat16)
+            updates_flat = torch.zeros(group["_total_numel"], device=params[0].device, dtype=torch.bfloat16)
+            grad_list = group["_grad_list"]
 
-            # Momentum + Nesterov per rank-local param
-            grad_tensors: dict[int, Tensor] = {}
-            for i, p in enumerate(params):
-                if i % world_size == rank and p.grad is not None:
-                    g = p.grad
-                    state = self.state[p]
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
-                    buf = state["momentum_buffer"]
-                    buf.mul_(momentum).add_(g)
-                    if nesterov:
-                        g = g.add(buf, alpha=momentum)
-                    grad_tensors[i] = g
+            # Momentum + Nesterov for rank-local params
+            for i in group["_local_indices"]:
+                p = params[i]
+                g = p.grad
+                if g is None:
+                    continue
+                buf = self.state[p]["momentum_buffer"]
+                buf.mul_(momentum).add_(g)
+                if nesterov:
+                    g = g.add(buf, alpha=momentum)
+                grad_list[i] = g
 
-            # Batched Newton-Schulz per precomputed shape bucket
+            # Batched Newton-Schulz per shape bucket
             for shape_key, bucket in group["_shape_buckets"].items():
-                items = [(off, grad_tensors[i]) for i, off in bucket if i in grad_tensors]
+                items = [(off, grad_list[i]) for i, off in bucket if grad_list[i] is not None]
                 if not items:
                     continue
                 batch = torch.stack([g for _, g in items])
                 ortho = zeropower_via_newtonschulz5_batched(batch, steps=backend_steps)
                 ortho *= group["_scale_cache"][shape_key]
+                bn = group["_bucket_numels"][shape_key]
                 for idx, (off, _) in enumerate(items):
-                    numel = ortho[idx].numel()
-                    updates_flat[off : off + numel] = ortho[idx].reshape(-1)
+                    updates_flat[off : off + bn] = ortho[idx].reshape(-1)
                 Muon.ns_calls += 1
 
-            if distributed:
+            # Clear grad_list for next step
+            for i in group["_local_indices"]:
+                grad_list[i] = None
+
+            if self._distributed:
                 dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
 
-            wd = group.get("wd", 0.0)
+            # Apply updates and weight decay
             offsets = group["_offsets"]
+            numels = group["_numels"]
             for i, p in enumerate(params):
-                off = offsets[i]
-                g = updates_flat[off : off + p.numel()].view_as(p).to(dtype=p.dtype)
+                g = updates_flat[offsets[i] : offsets[i] + numels[i]].view_as(p)
                 p.add_(g, alpha=-lr)
-                if wd > 0:
-                    p.data.mul_(1.0 - lr * wd)
+            if wd > 0:
+                for i in group["_local_indices"]:
+                    params[i].data.mul_(wd_factor)
 
         return loss
 
@@ -1097,8 +1106,11 @@ def main() -> None:
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
     ema_state: dict[str, Tensor] | None = None
+    ema_names: list[tuple[str, nn.Parameter]] | None = None
+    ema_alpha = 1.0 - args.ema_decay
     if args.ema_decay > 0:
         ema_state = {n: t.detach().cpu().float().clone() for n, t in base_model.state_dict().items()}
+        ema_names = list(base_model.named_parameters()) + list(base_model.named_buffers())
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params} swa_frac:{args.swa_frac} swa_every:{args.swa_every} quant_bits:{args.quant_bits}")
@@ -1217,8 +1229,8 @@ def main() -> None:
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
 
-        # QAT: enable fake quantization late in training
-        if args.qat_start_frac > 0:
+        # QAT: enable fake quantization late in training (one-way latch)
+        if args.qat_start_frac > 0 and not CastedLinear.qat_enabled:
             qat_frac = elapsed_ms / max_wallclock_ms if max_wallclock_ms else step / max(args.iterations, 1)
             CastedLinear.qat_enabled = qat_frac >= args.qat_start_frac
 
@@ -1234,10 +1246,11 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-        for group in optimizer_muon.param_groups:
-            group["momentum"] = muon_momentum
+        if args.muon_momentum_warmup_steps > 0 and step <= args.muon_momentum_warmup_steps:
+            frac = step / args.muon_momentum_warmup_steps
+            muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+            for group in optimizer_muon.param_groups:
+                group["momentum"] = muon_momentum
 
         for opt in optimizers:
             for group in opt.param_groups:
@@ -1251,9 +1264,8 @@ def main() -> None:
 
         if ema_state is not None:
             with torch.no_grad():
-                d = args.ema_decay
-                for n, t in base_model.state_dict().items():
-                    ema_state[n].lerp_(t.detach().cpu().float(), 1.0 - d)
+                for n, t in ema_names:
+                    ema_state[n].lerp_(t.to(device="cpu", dtype=torch.float32), ema_alpha)
 
         # Norm diagnostics every 500 steps
         if step % 500 == 0 and step > 0:
@@ -1279,7 +1291,7 @@ def main() -> None:
                     swa_count += 1
 
         step += 1
-        approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        approx_training_time_ms = elapsed_ms  # reuse value from LR schedule computation
         should_log_train = (
             args.train_log_every > 0
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
