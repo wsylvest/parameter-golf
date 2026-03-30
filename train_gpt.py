@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import uuid
+import lzma
 import zlib
 from pathlib import Path
 
@@ -1005,6 +1006,7 @@ def main() -> None:
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
+        weight_decay=args.adam_wd,
         fused=True,
     )
     optimizer_muon = Muon(
@@ -1020,6 +1022,7 @@ def main() -> None:
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
+        weight_decay=args.adam_wd,
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
@@ -1028,6 +1031,7 @@ def main() -> None:
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
+            weight_decay=args.adam_wd,
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
@@ -1313,8 +1317,9 @@ def main() -> None:
     quant_raw = quant_buf.getvalue()
     quant_blob_zlib = zlib.compress(quant_raw, level=9)
     quant_blob_zstd = zstandard.ZstdCompressor(level=22).compress(quant_raw) if zstandard else quant_blob_zlib
-    quant_blob = quant_blob_zstd if len(quant_blob_zstd) < len(quant_blob_zlib) else quant_blob_zlib
-    compress_method = "zstd" if len(quant_blob_zstd) < len(quant_blob_zlib) else "zlib"
+    quant_blob_lzma = lzma.compress(quant_raw, preset=6)
+    candidates = [("zlib", quant_blob_zlib), ("zstd", quant_blob_zstd), ("lzma", quant_blob_lzma)]
+    compress_method, quant_blob = min(candidates, key=lambda x: len(x[1]))
     quant_raw_bytes = len(quant_raw)
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
@@ -1333,10 +1338,12 @@ def main() -> None:
         dist.barrier()
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    try:
-        decompressed = zstandard.ZstdDecompressor().decompress(quant_blob_disk) if zstandard else zlib.decompress(quant_blob_disk)
-    except Exception:
-        decompressed = zlib.decompress(quant_blob_disk)
+    for decompress_fn in [lzma.decompress, zlib.decompress] + ([zstandard.ZstdDecompressor().decompress] if zstandard else []):
+        try:
+            decompressed = decompress_fn(quant_blob_disk)
+            break
+        except Exception:
+            continue
     quant_state = torch.load(io.BytesIO(decompressed), map_location="cpu")
     base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
@@ -1385,24 +1392,14 @@ def main() -> None:
         n_seqs = chunk_tokens // chunk_seq
         total_val = val_tokens.numel() - 1
         n_chunks = total_val // chunk_tokens
-        # Save initial state for per-chunk reset
         ttt_init_sd = copy.deepcopy(base_model.state_dict())
-        # Freeze matrix params (weight matrices) — only adapt embeds, scalars, gates, norms
-        ttt_params = []
-        for n, p in base_model.named_parameters():
-            if p.ndim >= 2 and min(p.shape) >= 64:
-                p.requires_grad_(False)
-            else:
-                ttt_params.append(p)
+        ttt_params = list(base_model.parameters())
         ttt_opt = torch.optim.SGD(ttt_params, lr=args.ttt_lr, momentum=0.9)
         ttt_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
         ttt_token_count = torch.zeros((), device=device, dtype=torch.float64)
         ttt_byte_count = torch.zeros((), device=device, dtype=torch.float64)
         log0(f"ttt: {n_chunks} chunks, {n_seqs} seqs/chunk, {args.ttt_epochs} ep, lr={args.ttt_lr}, adapted_params={len(ttt_params)}")
         for ci in range(n_chunks):
-            # Reset model to initial state each chunk
-            base_model.load_state_dict(ttt_init_sd, strict=True)
-            ttt_opt.state.clear()
             cos_lr = args.ttt_lr * 0.5 * (1.0 + math.cos(math.pi * ci / max(n_chunks - 1, 1)))
             for pg in ttt_opt.param_groups:
                 pg["lr"] = cos_lr
@@ -1423,7 +1420,7 @@ def main() -> None:
                 tb = base_bytes_lut[tgt_flat].to(torch.float64)
                 tb += (has_leading_space_lut[tgt_flat] & ~is_boundary_token_lut[prev_flat]).to(torch.float64)
                 ttt_byte_count += tb.sum()
-            # Adapt on scored chunk (batched), then discard adaptation
+            # Adapt on scored chunk (batched); adaptation accumulates across chunks
             base_model.train()
             for _ in range(args.ttt_epochs):
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
