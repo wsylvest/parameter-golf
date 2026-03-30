@@ -1092,6 +1092,9 @@ def main() -> None:
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
         for warmup_step in range(args.warmup_steps):
+            # Pre-warm both QAT-off and QAT-on compiled graphs during warmup
+            if args.qat_start_frac > 0 and warmup_step == args.warmup_steps - 1:
+                CastedLinear.qat_enabled = True
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
                 if distributed:
@@ -1105,6 +1108,7 @@ def main() -> None:
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+        CastedLinear.qat_enabled = False
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
