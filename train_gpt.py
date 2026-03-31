@@ -211,19 +211,49 @@ def _post_ns_normalize(X: Tensor, mode: str) -> Tensor:
     return X
 
 class Muon(torch.optim.Optimizer):
+    """Parallel Muon: reduce-scatter → local NS → all-gather pipeline.
+
+    On multi-GPU: after backward, launches async reduce-scatter for each param
+    (biggest first), runs NS on the local shard, then all-gathers the result.
+    Each all-gather overlaps with the next param's NS. On single-GPU: falls back
+    to batched NS on shape-bucketed banks (same as before).
+    """
     ns_calls: int = 0
 
     def __init__(self, params, lr: float, momentum: float, backend_steps: int,
                  nesterov: bool = True, post_norm: str = "none"):
         super().__init__(params, dict(lr=lr, momentum=momentum, backend_steps=backend_steps,
                                      nesterov=nesterov, post_norm=post_norm))
-        self._precomputed = False
+        self._built = False
 
     def load_state_dict(self, state_dict: dict) -> None:
         super().load_state_dict(state_dict)
-        self._precomputed = False
+        self._built = False
 
-    def _precompute(self) -> None:
+    def _build(self) -> None:
+        self._distributed = dist.is_available() and dist.is_initialized()
+        self._world_size = dist.get_world_size() if self._distributed else 1
+        self._rank = dist.get_rank() if self._distributed else 0
+        ws = self._world_size
+        # Build per-param metadata for distributed path
+        self._param_meta: list[dict] = []
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.ndim != 2: continue
+                B = p.shape[0]; tail = p.shape[1:]
+                padded_B = ((B + ws - 1) // ws) * ws; shard_B = padded_B // ws
+                dev = p.device
+                self._param_meta.append({
+                    "p": p, "B": B,
+                    "padded_grad": torch.zeros(padded_B, *tail, device=dev, dtype=torch.bfloat16),
+                    "shard": torch.zeros(shard_B, *tail, device=dev, dtype=torch.bfloat16),
+                    "shard_mom": torch.zeros(shard_B, *tail, device=dev, dtype=torch.bfloat16),
+                    "full_update": torch.zeros(padded_B, *tail, device=dev, dtype=torch.bfloat16),
+                    "scale": max(1, p.shape[0] / p.shape[1]) ** 0.5,
+                })
+        # Sort biggest first for optimal overlap
+        self._param_meta.sort(key=lambda m: -m["p"].numel())
+        # Build shape-bucketed banks for single-GPU fallback
         for group in self.param_groups:
             buckets: dict[tuple[int, int], list[int]] = {}
             params = group["params"]
@@ -235,55 +265,94 @@ class Muon(torch.optim.Optimizer):
             group["_buckets"] = buckets
             group["_banks"] = banks
             group["_scales"] = {s: max(1, s[0] / s[1]) ** 0.5 for s in buckets}
-        self._precomputed = True
+        self._built = True
+
+    def launch_reduce_scatters(self) -> None:
+        """Phase 1: launch async reduce-scatter for all params. Call right after backward."""
+        if not self._built: self._build()
+        if not self._distributed: return
+        self._rs_futures = []
+        for m in self._param_meta:
+            p = m["p"]
+            if p.grad is None:
+                self._rs_futures.append(None); continue
+            pg = m["padded_grad"]; pg[:m["B"]].copy_(p.grad.bfloat16())
+            if pg.shape[0] > m["B"]: pg[m["B"]:].zero_()
+            fut = dist.reduce_scatter_tensor(m["shard"], pg, op=dist.ReduceOp.AVG, async_op=True)
+            self._rs_futures.append(fut)
 
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
         if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-        if not self._precomputed:
-            self._precompute()
+            with torch.enable_grad(): loss = closure()
+        if not self._built: self._build()
+
         for group in self.param_groups:
             lr, mom, bs = group["lr"], group["momentum"], group["backend_steps"]
-            nesterov, wd = group["nesterov"], group.get("wd", 0.0)
+            nesterov = group["nesterov"]
+            wd = group.get("wd", 0.0)
             post_norm = group.get("post_norm", "none")
-            params = group["params"]
-            # Momentum + Nesterov on individual params
-            for i, p in enumerate(params):
-                if p.grad is None or p.ndim != 2:
-                    continue
-                g = p.grad
-                state = self.state[p]
-                if "momentum_buffer" not in state:
-                    state["momentum_buffer"] = torch.zeros_like(g)
-                buf = state["momentum_buffer"]
-                buf.mul_(mom).add_(g)
-                self.state[p]["_ns_grad"] = g.add(buf, alpha=mom) if nesterov else buf.clone()
-            # Gather → batched NS (unified 3D path) → scatter per shape bucket
-            for shape, idxs in group["_buckets"].items():
-                bank = group["_banks"][shape]
-                active = []
-                for slot, pi in enumerate(idxs):
-                    ns_g = self.state[params[pi]].get("_ns_grad")
-                    if ns_g is not None:
-                        bank[slot].copy_(ns_g)
-                        active.append((slot, pi))
-                    else:
-                        bank[slot].zero_()
-                if not active:
-                    continue
-                ortho = zeropower_via_newtonschulz5(bank, steps=bs)  # 3D path
-                ortho = _post_ns_normalize(ortho, post_norm)
-                ortho *= group["_scales"][shape]
-                Muon.ns_calls += 1
-                for slot, pi in active:
-                    p = params[pi]
-                    p.add_(ortho[slot].to(p.dtype), alpha=-lr)
-                    if wd > 0:
-                        p.data.mul_(1.0 - lr * wd)
-                    self.state[p].pop("_ns_grad", None)
+
+            if self._distributed and hasattr(self, "_rs_futures"):
+                # --- Parallel path: wait RS → local NS → async AG ---
+                prev_ag, prev_m = None, None
+                for i, m in enumerate(self._param_meta):
+                    p = m["p"]
+                    if p.grad is None: continue
+                    # Finalize previous all-gather
+                    if prev_ag is not None:
+                        prev_ag.wait()
+                        pp = prev_m["p"]; upd = prev_m["full_update"][:prev_m["B"]]
+                        pp.add_(upd.to(pp.dtype), alpha=-lr * prev_m["scale"])
+                        if wd > 0: pp.data.mul_(1.0 - lr * wd)
+                    # Wait for this param's reduce-scatter
+                    if self._rs_futures[i] is not None:
+                        self._rs_futures[i].wait()
+                    # Momentum on shard
+                    g = m["shard"]; buf = m["shard_mom"]
+                    buf.mul_(mom).add_(g)
+                    update = g.add(buf, alpha=mom) if nesterov else buf
+                    # NS on local shard (2D path)
+                    update = zeropower_via_newtonschulz5(update, steps=bs)
+                    update = _post_ns_normalize(update, post_norm)
+                    Muon.ns_calls += 1
+                    # Launch async all-gather
+                    prev_ag = dist.all_gather_into_tensor(m["full_update"], update, async_op=True)
+                    prev_m = m
+                # Finalize last all-gather
+                if prev_ag is not None:
+                    prev_ag.wait()
+                    pp = prev_m["p"]; upd = prev_m["full_update"][:prev_m["B"]]
+                    pp.add_(upd.to(pp.dtype), alpha=-lr * prev_m["scale"])
+                    if wd > 0: pp.data.mul_(1.0 - lr * wd)
+                if hasattr(self, "_rs_futures"): del self._rs_futures
+            else:
+                # --- Single-GPU path: batched NS on shape-bucketed banks ---
+                params = group["params"]
+                for i, p in enumerate(params):
+                    if p.grad is None or p.ndim != 2: continue
+                    g = p.grad; state = self.state[p]
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(g)
+                    buf = state["momentum_buffer"]; buf.mul_(mom).add_(g)
+                    self.state[p]["_ns_grad"] = g.add(buf, alpha=mom) if nesterov else buf.clone()
+                for shape, idxs in group["_buckets"].items():
+                    bank = group["_banks"][shape]; active = []
+                    for slot, pi in enumerate(idxs):
+                        ns_g = self.state[params[pi]].get("_ns_grad")
+                        if ns_g is not None: bank[slot].copy_(ns_g); active.append((slot, pi))
+                        else: bank[slot].zero_()
+                    if not active: continue
+                    ortho = zeropower_via_newtonschulz5(bank, steps=bs)  # 3D batched path
+                    ortho = _post_ns_normalize(ortho, post_norm)
+                    ortho *= group["_scales"][shape]
+                    Muon.ns_calls += 1
+                    for slot, pi in active:
+                        p = params[pi]
+                        p.add_(ortho[slot].to(p.dtype), alpha=-lr)
+                        if wd > 0: p.data.mul_(1.0 - lr * wd)
+                        self.state[p].pop("_ns_grad", None)
         return loss
 
 # --- TOKENIZER-AGNOSTIC EVALUATION (BPB metric) ---
@@ -1065,6 +1134,131 @@ def collect_hessians(model: nn.Module, loader: "DistributedTokenLoader",
     model.train()
     return {k: v.cpu() for k, v in hessians.items()}
 
+# --- MIXED-PRECISION BIT ALLOCATION ---
+# Allocate int5/6/7 per tensor group based on Hessian sensitivity and byte budget.
+# Most sensitive layers get int7, then int6, rest int5. Greedy fill within 16MB.
+
+_MP_BYTES_PP_INT5 = 0.46     # estimated compressed bytes per param at int5
+_MP_COST_PER_BIT = 0.24      # additional compressed bytes per extra bit above int5
+_MP_NON_WEIGHT_RATIO = 0.55  # compression ratio for non-quantized tensors
+_MP_PRUNE_HEADROOM = 0.02    # reserve 2% of byte budget for selective pruning
+
+def allocate_bits_mixed(hessians: "dict[str, Tensor]", state_dict: "dict[str, Tensor]",
+                        target_bytes: int = 16_000_000, code_bytes: int = 0
+                        ) -> "tuple[dict[str, int], dict[str, float]]":
+    """Allocate per-tensor bit widths based on Hessian sensitivity. Returns (name→bits, info)."""
+    group_traces: dict[str, list[float]] = {}
+    group_numel: dict[str, int] = {}
+    tensor_group: dict[str, str] = {}
+    for name, H in hessians.items():
+        tr = float(torch.trace(H).item()) / H.shape[0]
+        if not name.startswith("blocks."): continue
+        dot2 = name.index(".", 7)
+        li = int(name[7:dot2])
+        gtype = "attn" if ".attn." in name else "mlp" if ".mlp." in name else "other"
+        gkey = f"L{li}.{gtype}"
+        group_traces.setdefault(gkey, []).append(tr)
+        tensor_group[name] = gkey
+        w = state_dict.get(name)
+        if w is not None:
+            group_numel[gkey] = group_numel.get(gkey, 0) + w.numel()
+    gsens = {k: sum(v) / len(v) for k, v in group_traces.items()}
+    ranked = sorted(gsens.items(), key=lambda x: x[1], reverse=True)
+    # Estimate baseline (all int5)
+    total_qn = sum(group_numel.values())
+    nw_raw = sum(t.numel() * t.element_size() for n, t in state_dict.items() if n not in hessians)
+    base = code_bytes + int(nw_raw * _MP_NON_WEIGHT_RATIO) + int(total_qn * _MP_BYTES_PP_INT5)
+    budget = int(target_bytes * (1 - _MP_PRUNE_HEADROOM)) - base
+    gbits: dict[str, int] = {g: 5 for g, _ in ranked}
+    extra = 0
+    if budget > 0 and ranked:
+        # Top group → int7
+        top = ranked[0][0]; tn = group_numel.get(top, 0)
+        c7 = int(tn * _MP_COST_PER_BIT * 2)
+        c6 = int(tn * _MP_COST_PER_BIT)
+        if c7 <= budget: gbits[top] = 7; extra += c7
+        elif c6 <= budget: gbits[top] = 6; extra += c6
+        # Rest → int6 if fits
+        for g, _ in ranked:
+            if gbits[g] > 5: continue
+            n = group_numel.get(g, 0)
+            if n == 0: continue
+            c = int(n * _MP_COST_PER_BIT)
+            if extra + c <= budget: gbits[g] = 6; extra += c
+    bits_map = {tn: gbits[g] for tn, g in tensor_group.items()}
+    info = {"base_mb": base / 1e6, "extra_mb": extra / 1e6, "budget_mb": target_bytes / 1e6}
+    return bits_map, info
+
+
+def selective_prune(quant_data: "dict[str, Tensor]", target_bytes: int, code_bytes: int,
+                    log_fn: "callable" = print) -> None:
+    """Prune small quantized values (|q|<=2) to fit compressed artifact under target_bytes.
+    Uses binary search with fast (zlib-1) probing, verified with real compressor."""
+    # Collect pruneable entries: values with |q| in {1, 2} sorted by abs value
+    entries: list[tuple[str, int]] = []  # (tensor_name, flat_index)
+    for name, t in quant_data.items():
+        if t.dtype != torch.int8 or t.ndim < 2: continue
+        flat = t.reshape(-1)
+        mask = (flat.abs() >= 1) & (flat.abs() <= 2)
+        idxs = mask.nonzero(as_tuple=True)[0]
+        vals = flat[idxs].abs().float()
+        # Sort by ascending abs value (prune smallest first)
+        order = vals.argsort()
+        for oi in order:
+            entries.append((name, int(idxs[oi].item())))
+    if not entries:
+        return
+
+    def _compress_size(fast: bool = False) -> int:
+        buf = io.BytesIO(); torch.save(quant_data, buf); raw = buf.getvalue()
+        if fast: return len(zlib.compress(raw, 1)) + code_bytes
+        raw_s = _byte_shuffle(raw, stride=2)
+        blob = brotli.compress(raw_s, quality=11) if brotli else lzma.compress(raw, preset=6)
+        return len(blob) + code_bytes
+
+    no_prune_sz = _compress_size()
+    log_fn(f"selective_prune: {len(entries)} candidates, unpruned={no_prune_sz/1e6:.2f}MB target={target_bytes/1e6:.2f}MB")
+    if no_prune_sz <= target_bytes:
+        log_fn("selective_prune: already fits"); return
+
+    def _apply(n: int) -> None:
+        for i in range(min(n, len(entries))):
+            tn, fi = entries[i]
+            quant_data[tn].reshape(-1)[fi] = 0
+
+    def _trial(n: int, fast: bool = False) -> int:
+        # Save, prune, measure, restore
+        saved = {tn: quant_data[tn].clone() for tn in {e[0] for e in entries[:n]}}
+        _apply(n)
+        sz = _compress_size(fast=fast)
+        for tn, t in saved.items(): quant_data[tn].copy_(t)
+        return sz
+
+    # Binary search with fast compressor
+    full_prune_fast = _trial(len(entries), fast=True)
+    no_prune_fast = _trial(0, fast=True)
+    full_prune_real = _trial(len(entries))
+    if full_prune_real > target_bytes:
+        log_fn("selective_prune: even full prune not enough, applying all")
+        _apply(len(entries)); return
+    # Calibrate fast/real ratio
+    fd = no_prune_fast - full_prune_fast; rd = no_prune_sz - full_prune_real
+    ratio = rd / max(fd, 1)
+    fast_target = no_prune_fast - int((no_prune_sz - target_bytes) / max(ratio, 0.01))
+    lo, hi = 0, len(entries)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _trial(mid, fast=True) <= fast_target: hi = mid
+        else: lo = mid + 1
+    # Verify with real compressor
+    real_sz = _trial(lo)
+    while lo < len(entries) and real_sz > target_bytes:
+        lo += max(1, len(entries) // 200); lo = min(lo, len(entries))
+        real_sz = _trial(lo)
+    log_fn(f"selective_prune: pruning {lo}/{len(entries)} ({100*lo/max(len(entries),1):.1f}%) to fit")
+    _apply(lo)
+
+
 # --- TRAINING ---
 
 def main() -> None:
@@ -1414,6 +1608,10 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
+        # Launch async reduce-scatters for Parallel Muon immediately after backward
+        if distributed:
+            optimizer_muon.launch_reduce_scatters()
+
         if do_profile:
             _pev["fb"].record()
 
@@ -1429,8 +1627,12 @@ def main() -> None:
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        # Step Adam optimizers first (overlaps with Muon reduce-scatter in flight)
         for opt in optimizers:
-            opt.step()
+            if opt is not optimizer_muon:
+                opt.step()
+        # Muon step last: waits for RS, runs local NS, all-gathers
+        optimizer_muon.step()
         zero_grad_all()
 
         if do_profile:
@@ -1535,37 +1737,54 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    # --- Hessian GPTQ Export ---
-    # Collect Hessians on a fresh calibration loader (training data only, never val)
+    # --- Hessian GPTQ Export with Mixed-Precision Allocation ---
     log0("gptq: collecting hessians...")
     t_gptq = time.perf_counter()
     calib_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
     hessians = collect_hessians(base_model, calib_loader, args, device, grad_accum_steps, num_batches=64)
     log0(f"gptq: collected {len(hessians)} hessians in {time.perf_counter() - t_gptq:.1f}s")
-    # Build GPTQ-quantized state dict using Hessians where available
-    layer_bits = None
-    if args.adaptive_quant:
-        layer_bits = {i: int(b) for i, b in enumerate(args.adaptive_quant.split(","))}
-        log0(f"adaptive_quant: {layer_bits}")
+
     sd = base_model.state_dict()
-    gptq_sd: dict[str, Tensor] = {}
+    code_bytes = len(code.encode("utf-8"))
+
+    # Mixed-precision bit allocation: int5/6/7 per layer based on Hessian sensitivity
+    bits_map, mp_info = allocate_bits_mixed(hessians, sd, target_bytes=16_000_000, code_bytes=code_bytes)
+    log0(f"mixed_precision: base={mp_info['base_mb']:.2f}MB extra={mp_info['extra_mb']:.2f}MB budget={mp_info['budget_mb']:.2f}MB")
+    for name, bits in sorted(bits_map.items()):
+        if bits != 6: log0(f"  {name}: int{bits}")
+
+    # Apply Hessian GPTQ with per-tensor bit widths
+    quant_result: dict[str, Tensor] = {}
+    quant_scales: dict[str, Tensor] = {}
+    quant_dtypes: dict[str, str] = {}
+    passthrough: dict[str, Tensor] = {}
     for name, tensor in sd.items():
-        gptq_sd[name] = tensor
-    # Apply GPTQ to CastedLinear weights that have Hessians
-    for mod_name, H in hessians.items():
-        w = sd.get(mod_name)
-        if w is None or w.ndim != 2 or w.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+        t = tensor.detach().cpu().contiguous()
+        if not t.is_floating_point() or t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL or name == "tok_emb.weight":
+            passthrough[name] = t.to(torch.float16) if t.is_floating_point() else t
             continue
-        qmax = 31  # int6 (range -31 to 31)
-        q, s = quantize_int_gptq(w, hessian=H, qmax=qmax)
-        gptq_sd[mod_name] = q  # store quantized; scale stored separately below
-        gptq_sd[mod_name.replace(".weight", ".scale_gptq")] = s
-    # Fall back to standard int8 quant for remaining weights
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict(), quant_bits=args.quant_bits, layer_bits=layer_bits)
+        if any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS):
+            passthrough[name] = t.float()
+            continue
+        H = hessians.get(name)
+        bits = bits_map.get(name, 6)
+        qmax = (1 << (bits - 1)) - 1  # int5→15, int6→31, int7→63
+        q, s = quantize_int_gptq(t, hessian=H, qmax=qmax)
+        quant_result[name] = q
+        quant_scales[name] = s
+        quant_dtypes[name] = str(t.dtype).removeprefix("torch.")
+
+    quant_obj = {"quantized": quant_result, "scales": quant_scales, "dtypes": quant_dtypes,
+                 "passthrough": passthrough, "bits_map": {k: v for k, v in bits_map.items()},
+                 "__quant_format__": "hessian_gptq_mixed_v1"}
+
+    # Selective pruning to fit under 16MB
+    selective_prune(quant_result, target_bytes=16_000_000, code_bytes=code_bytes, log_fn=log0)
+
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
-    # Byte-shuffle + brotli compression pipeline
+    # Byte-shuffle + best compression
     quant_shuffled = _byte_shuffle(quant_raw, stride=2)
     quant_blob_brotli = brotli.compress(quant_shuffled, quality=11) if brotli else None
     quant_blob_lzma = lzma.compress(quant_raw, preset=6)
@@ -1576,16 +1795,14 @@ def main() -> None:
     if quant_blob_brotli: candidates.append(("brotli+shuffle", quant_blob_brotli))
     compress_method, quant_blob = min(candidates, key=lambda x: len(x[1]))
     quant_raw_bytes = len(quant_raw)
+    quant_raw_bytes = len(quant_raw)
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
             f.write(quant_blob)
         quant_file_bytes = os.path.getsize("final_model.int8.ptz")
-        code_bytes = len(code.encode("utf-8"))
-        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
             f"Serialized model quant+{compress_method}: {quant_file_bytes} bytes "
-            f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x "
-            f"zstd:{len(quant_blob_zstd)} zlib:{len(quant_blob_zlib)})"
+            f"(raw_torch:{quant_raw_bytes} zlib:{len(quant_blob_zlib)})"
         )
         log0(f"Total submission size quant+{compress_method}: {quant_file_bytes + code_bytes} bytes")
 
@@ -1593,14 +1810,33 @@ def main() -> None:
         dist.barrier()
     with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
-    for decompress_fn in [lzma.decompress, zlib.decompress] + ([zstandard.ZstdDecompressor().decompress] if zstandard else []) + ([brotli.decompress] if brotli else []):
+    # Decompress: try all formats, then un-shuffle if needed
+    decompressed = None
+    for decompress_fn in ([brotli.decompress] if brotli else []) + [lzma.decompress, zlib.decompress] + ([zstandard.ZstdDecompressor().decompress] if zstandard else []):
         try:
-            decompressed = decompress_fn(quant_blob_disk)
-            break
-        except Exception:
-            continue
+            decompressed = decompress_fn(quant_blob_disk); break
+        except Exception: continue
+    if decompressed is None:
+        raise RuntimeError("Failed to decompress quantized model")
+    decompressed = _byte_unshuffle(decompressed)  # auto-detects BSHF header
     quant_state = torch.load(io.BytesIO(decompressed), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+
+    # Dequantize: handle both legacy int8 format and new Hessian GPTQ mixed format
+    if quant_state.get("__quant_format__", "").startswith("hessian_gptq"):
+        dequant_sd: dict[str, Tensor] = {}
+        bm = quant_state.get("bits_map", {})
+        for name, q in quant_state["quantized"].items():
+            dtype = getattr(torch, quant_state["dtypes"][name])
+            s = quant_state["scales"][name]
+            if s.ndim > 0:
+                dequant_sd[name] = (q.float() * s.float().view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype).contiguous()
+            else:
+                dequant_sd[name] = (q.float() * float(s.item())).to(dtype).contiguous()
+        for name, t in quant_state["passthrough"].items():
+            dequant_sd[name] = t
+        base_model.load_state_dict(dequant_sd, strict=True)
+    else:
+        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
