@@ -167,11 +167,12 @@ class Hyperparameters:
 # Handles both 2D (single matrix) and 3D (batched) inputs in one unified function.
 
 _AOL_POLAR_COEFFS = [
-    (4.107059, -2.947850, 0.544843),   # iter 2 (AOL skips iter 1)
-    (3.948691, -2.908902, 0.551819),   # iter 3
-    (3.318420, -2.488488, 0.510049),   # iter 4
-    (2.300652, -1.668904, 0.418807),   # iter 5
-    (1.875,    -1.25,     0.375),      # iter 6+: converged fixed point
+    (4.107059111542203,  -2.9478499167379106,  0.5448431082926601),   # iter 2 (AOL skips iter 1)
+    (3.9486908534822946, -2.908902115962949,   0.5518191394370137),   # iter 3
+    (3.3184196573706015, -2.488488024314874,   0.51004894012372),     # iter 4
+    (2.300652019954817,  -1.6689039845747493,  0.4188073119525673),   # iter 5
+    (1.891301407787398,  -1.2679958271945868,  0.37680408948524835),  # iter 6
+    (1.875, -1.25, 0.375),                                            # iter 7+: converged fixed point
 ]
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int = 4, eps: float = 1e-7) -> Tensor:
@@ -723,8 +724,6 @@ class RMSNorm(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         return F.rms_norm(x, (x.size(-1),), eps=self.eps)
 
-INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
-
 class CastedLinear(nn.Linear):
     qat_enabled: bool = False
     qat_soft_round: bool = False   # if True, use differentiable soft-round instead of STE
@@ -1006,9 +1005,10 @@ class GPT(nn.Module):
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
+                skip = skips.pop()
                 g = torch.sigmoid(self.skip_gates[i].to(dtype=x.dtype))[None, None, :]
-                sw = self.skip_weights[i].to(dtype=x.dtype)[None, None, :]
-                x = x + g * sw * skips.pop()
+                scaled_skip = self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip
+                x = torch.lerp(scaled_skip, x, g)
             li = self.num_encoder_layers + i
             v_emb = ve_map[li](input_ids) if li in ve_map else None
             x = self.blocks[li](x, x0, v_embed=v_emb)
@@ -1302,8 +1302,8 @@ def main() -> None:
 
     enable_cudnn_sdp(True)
     enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    enable_mem_efficient_sdp(True)
+    enable_math_sdp(True)
 
     logfile = None
     if master_process:
@@ -1815,7 +1815,6 @@ def main() -> None:
     if quant_blob_zstd: candidates.append(("zstd", quant_blob_zstd))
     if quant_blob_brotli: candidates.append(("brotli+shuffle", quant_blob_brotli))
     compress_method, quant_blob = min(candidates, key=lambda x: len(x[1]))
-    quant_raw_bytes = len(quant_raw)
     quant_raw_bytes = len(quant_raw)
     if master_process:
         with open("final_model.int8.ptz", "wb") as f:
