@@ -35,7 +35,8 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
-from torch.nn.parallel import DistributedDataParallel as DDP
+# DDP not used: Parallel Muon handles gradient sync for matrix params;
+# non-Muon params get manual coalesced all-reduce.
 
 # --- BYTE-SHUFFLE COMPRESSION ---
 # Reorder bytes by significance position before compression.
@@ -1379,8 +1380,9 @@ def main() -> None:
         compile_kwargs["mode"] = args.compile_mode
     log0(f"compile: mode={args.compile_mode} grad_accum={grad_accum_steps}")
     compiled_model = torch.compile(base_model, **compile_kwargs)
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False,
-                           gradient_as_bucket_view=True) if distributed else compiled_model
+    # No DDP: Parallel Muon handles matrix param communication via reduce-scatter/all-gather.
+    # Non-Muon params (scalars, embeddings) get manual coalesced all-reduce before Adam steps.
+    model: nn.Module = compiled_model
 
     # Optimizer split: matrix weights via Muon (gather-scatter), scalars via Adam
     block_named_params = list(base_model.blocks.named_parameters())
@@ -1436,6 +1438,15 @@ def main() -> None:
             fused=True,
         )
         optimizers.insert(1, optimizer_head)
+
+    # Build replicated param list for manual all-reduce (non-Muon params need gradient sync)
+    replicated_params: list[nn.Parameter] = []
+    replicated_params.append(base_model.tok_emb.weight)
+    replicated_params.extend(scalar_params)
+    if base_model.lm_head is not None:
+        replicated_params.append(base_model.lm_head.weight)
+    _repl_numels = [p.numel() for p in replicated_params]
+    _repl_grad_buf = torch.zeros(sum(_repl_numels), device=device, dtype=torch.bfloat16) if distributed else None
 
     global _QUANT_BITS_QAT
     _QUANT_BITS_QAT = args.quant_bits
@@ -1509,8 +1520,6 @@ def main() -> None:
                 CastedLinear.qat_enabled = True
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
-                if distributed:
-                    model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
@@ -1525,8 +1534,6 @@ def main() -> None:
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
         zero_grad_all()
-        if distributed:
-            model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
 
     # -----------------------------
@@ -1599,8 +1606,6 @@ def main() -> None:
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
-            if distributed:
-                model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
@@ -1608,9 +1613,25 @@ def main() -> None:
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
 
-        # Launch async reduce-scatters for Parallel Muon immediately after backward
+        # Phase 1: Launch async reduce-scatters for Muon matrix params
         if distributed:
             optimizer_muon.launch_reduce_scatters()
+
+        # Phase 2: Manual coalesced all-reduce for non-Muon replicated params
+        if distributed and _repl_grad_buf is not None:
+            off = 0
+            for p, n in zip(replicated_params, _repl_numels):
+                if p.grad is not None:
+                    _repl_grad_buf[off:off + n].copy_(p.grad.reshape(-1).bfloat16())
+                else:
+                    _repl_grad_buf[off:off + n].zero_()
+                off += n
+            dist.all_reduce(_repl_grad_buf, op=dist.ReduceOp.AVG)
+            off = 0
+            for p, n in zip(replicated_params, _repl_numels):
+                if p.grad is not None:
+                    p.grad.copy_(_repl_grad_buf[off:off + n].reshape_as(p.grad))
+                off += n
 
         if do_profile:
             _pev["fb"].record()
@@ -1631,7 +1652,7 @@ def main() -> None:
         for opt in optimizers:
             if opt is not optimizer_muon:
                 opt.step()
-        # Muon step last: waits for RS, runs local NS, all-gathers
+        # Phase 3: Muon step — waits for RS, runs local NS, all-gathers
         optimizer_muon.step()
         zero_grad_all()
 
